@@ -1,0 +1,118 @@
+{
+  "manifestVersion": 2,
+  "id": "agy-account-switcher",
+  "name": "反重力多账号一键切换",
+  "version": "0.2.7",
+  "description": "实时查看所有 Antigravity 账号额度，一键切换账号并将跨工作区运行中的 agy 终端原地无损换号续接对话；精确观测并区分宿主/托管原生 Chat 对话状态与后台回跳风险。",
+  "engines": {
+    "orca": ">=1.4.259"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "switcher",
+        "title": "反重力换号",
+        "icon": "zap",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "agy-account-status",
+        "icon": "zap",
+        "text": "AGY 检测中...",
+        "tone": "neutral",
+        "tooltip": "反重力 (AGY) 账号与终端状态（仅展示，换号请打开右侧「反重力换号」面板）"
+      }
+    ],
+    "commands": [
+      {
+        "id": "agy-switcher.quickSync",
+        "title": "反重力：智能同步空闲旧号终端 / 自动换最空闲号"
+      },
+      {
+        "id": "agy-switcher.syncToCurrent",
+        "title": "反重力：将所有旧号终端同步到当前账号"
+      },
+      {
+        "id": "agy-switcher.switchBest",
+        "title": "反重力：切换到额度最充裕账号并同步全部终端"
+      },
+      {
+        "id": "agy-switcher.refresh",
+        "title": "反重力：刷新账号额度与终端状态"
+      },
+      {
+        "id": "agy-switcher.cancelQueue",
+        "title": "反重力：清空等待换号队列"
+      }
+    ],
+    "events": [
+      {
+        "on": "agent.status.changed"
+      },
+      {
+        "on": "workspace.changed"
+      }
+    ],
+    "settings": [
+      {
+        "key": "processPollIntervalSec",
+        "title": "本地进程巡检间隔（秒）",
+        "description": "纯本地轻量扫描运行中的 agy 终端与旧号进程的间隔（不请求远程额度接口）。",
+        "type": "integer",
+        "default": 15,
+        "minimum": 10,
+        "maximum": 120
+      },
+      {
+        "key": "quotaPollIntervalSec",
+        "title": "远程额度刷新间隔（秒）",
+        "description": "调用 orca account list 拉取各账号 5 小时/周额度的周期（存在旧号进程时自动缩至最高 45 秒以加速漂移检测）。",
+        "type": "integer",
+        "default": 120,
+        "minimum": 30,
+        "maximum": 600
+      },
+      {
+        "key": "workingPolicy",
+        "title": "遇到正在干活的终端时",
+        "description": "一键全终端换号时，对正在执行任务（working）或状态未知的 agy 终端采取的默认策略。",
+        "type": "string",
+        "default": "queue",
+        "enum": ["queue", "skip", "force"],
+        "enumLabels": [
+          "等待空闲后自动原地切号（安全推荐）",
+          "跳过正在干活的终端",
+          "立即强制原地重启"
+        ]
+      },
+      {
+        "key": "autoGuardDrift",
+        "title": "账号漂移提醒",
+        "description": "当检测到旧终端或 ACP 进程刷新 Token 把全局账号顶回旧号时，发送桌面通知提醒。",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "notifyOnComplete",
+        "title": "切换完成通知",
+        "description": "一键换号或排队终端自动补切完成后，显示桌面通知。",
+        "type": "boolean",
+        "default": true
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" },
+    { "kind": "agent:read" },
+    { "kind": "notifications:show" },
+    { "kind": "storage:own" },
+    { "kind": "settings:own" }
+  ]
+}
