@@ -14,12 +14,15 @@ import {
   isManagedAcpCommand,
   isQuotaWindowExpired,
   pickBestAccount,
+  resolveAccountQuotaPools,
+  resolvePrimaryQuota,
   shellQuote,
   shouldIgnoreUnstructuredAcpProbe
 } from './command-builder'
 import type { AccountInfo } from './protocol'
 import { SwitcherService } from './switcher'
 import {
+  parseAccountBuckets,
   parseLsofOutput,
   parsePsEnvOutput,
   type QueryResult,
@@ -1271,4 +1274,311 @@ test('[v0.2.7] computeStatusBar 全部状态 tooltip 均标明反重力身份且
     assert.ok(sb.text.length <= 64)
     assert.ok(sb.tooltip.length <= 256)
   }
+})
+
+test('[v0.2.8] parseAccountBuckets 与分池解析严格隔离 Gemini 主池与 Claude/GPT 副池（选号与状态栏不被跨池汇总污染）', () => {
+  const now = new Date(2026, 10, 24, 23, 0, 0).getTime()
+  const gem5hReset = now + 2 * 3600_000 + 33 * 60_000
+  const gemWeekReset = now + (6 * 24 + 5) * 3600_000
+  const claude5hReset = now + 4 * 3600_000 + 58 * 60_000
+  const claudeWeekReset = now + (4 * 24 + 16) * 3600_000
+
+  // 1) 验证 parseAccountBuckets 解析真实 Orca usage.buckets 结构及 fallback 字段名
+  const parsed = parseAccountBuckets([
+    {
+      name: 'Gemini Models · Weekly',
+      group: 'Gemini Models',
+      windowName: 'Weekly Limit Remaining',
+      usedPercent: 28,
+      windowMinutes: 10080,
+      resetsAt: gemWeekReset
+    },
+    {
+      name: 'Gemini Models · Five Hour',
+      group: 'Gemini Models',
+      windowName: 'Five Hour Limit Remaining',
+      usedPercent: 48,
+      windowMinutes: 300,
+      resetsAt: gem5hReset
+    },
+    {
+      name: 'Claude and GPT models · Weekly',
+      group: 'Claude and GPT models',
+      windowName: 'Weekly Limit Remaining',
+      usedPercent: 93,
+      windowMinutes: 10080,
+      resetsAt: claudeWeekReset
+    },
+    {
+      name: 'Claude and GPT models · Five Hour',
+      group: 'Claude and GPT models',
+      windowName: 'Five Hour Limit Remaining',
+      usedPercent: 0,
+      windowMinutes: 300,
+      resetsAt: claude5hReset
+    }
+  ])
+  assert.equal(parsed.length, 2)
+  assert.equal(parsed[0]!.group, 'Gemini Models')
+  assert.equal(parsed[0]!.sessionUsedPercent, 48)
+  assert.equal(parsed[0]!.weeklyUsedPercent, 28)
+  assert.equal(parsed[1]!.group, 'Claude and GPT models')
+  assert.equal(parsed[1]!.sessionUsedPercent, 0)
+  assert.equal(parsed[1]!.weeklyUsedPercent, 93)
+
+  // 2) 还原真实故障账号：顶层 weekly 为跨池最大值 93%（来自 Claude/GPT），但 Gemini 周实际仅 28%
+  const accMixed: AccountInfo = {
+    id: 'acc-mixed',
+    email: 'mixed@example.com',
+    label: null,
+    isActive: true,
+    isSelected: true,
+    status: 'ok',
+    sessionUsedPercent: 48,
+    sessionResetsAt: gem5hReset,
+    weeklyUsedPercent: 93,
+    weeklyResetsAt: claudeWeekReset,
+    buckets: parsed,
+    terminalCount: 6,
+    usageUpdatedAt: now - 60_000
+  }
+
+  const pools = resolveAccountQuotaPools(accMixed)
+  assert.equal(pools.primary.name, 'Gemini')
+  assert.equal(pools.primary.sessionUsedPercent, 48)
+  assert.equal(pools.primary.sessionResetsAt, gem5hReset)
+  assert.equal(pools.primary.weeklyUsedPercent, 28)
+  assert.equal(pools.primary.weeklyResetsAt, gemWeekReset)
+  assert.equal(pools.secondary.length, 1)
+  assert.equal(pools.secondary[0]!.name, 'Claude/GPT')
+  assert.equal(pools.secondary[0]!.weeklyUsedPercent, 93)
+
+  // 3) 选号排序不被副池 100% 误杀：A 号 Gemini 5h=12%/周=20%（Claude 5h=100% 导致顶层 session=100%），
+  //    B 号 Gemini 5h=60%/周=50%（Claude 全 0%）。自动选号必须选 Gemini 更充裕的 A！
+  const accAGemFreeClaudeFull: AccountInfo = {
+    id: 'acc-a',
+    email: 'a@example.com',
+    label: null,
+    isActive: false,
+    isSelected: false,
+    status: 'ok',
+    sessionUsedPercent: 100,
+    sessionResetsAt: claude5hReset,
+    weeklyUsedPercent: 95,
+    weeklyResetsAt: claudeWeekReset,
+    buckets: [
+      {
+        group: 'Gemini Models',
+        sessionUsedPercent: 12,
+        sessionResetsAt: gem5hReset,
+        weeklyUsedPercent: 20,
+        weeklyResetsAt: gemWeekReset
+      },
+      {
+        group: 'Claude and GPT models',
+        sessionUsedPercent: 100,
+        sessionResetsAt: claude5hReset,
+        weeklyUsedPercent: 95,
+        weeklyResetsAt: claudeWeekReset
+      }
+    ],
+    terminalCount: 0,
+    usageUpdatedAt: now - 60_000
+  }
+  const accBGemBusyClaudeFree: AccountInfo = {
+    id: 'acc-b',
+    email: 'b@example.com',
+    label: null,
+    isActive: false,
+    isSelected: false,
+    status: 'ok',
+    sessionUsedPercent: 60,
+    sessionResetsAt: gem5hReset,
+    weeklyUsedPercent: 50,
+    weeklyResetsAt: gemWeekReset,
+    buckets: [
+      {
+        group: 'Gemini Models',
+        sessionUsedPercent: 60,
+        sessionResetsAt: gem5hReset,
+        weeklyUsedPercent: 50,
+        weeklyResetsAt: gemWeekReset
+      },
+      {
+        group: 'Claude and GPT models',
+        sessionUsedPercent: 0,
+        sessionResetsAt: claude5hReset,
+        weeklyUsedPercent: 0,
+        weeklyResetsAt: claudeWeekReset
+      }
+    ],
+    terminalCount: 0,
+    usageUpdatedAt: now - 60_000
+  }
+  assert.equal(pickBestAccount([accBGemBusyClaudeFree, accAGemFreeClaudeFull], now)?.id, 'acc-a')
+
+  // 4) 主池完全打平时，次级按副池余量选出更空闲号
+  const accCTieClaudeFree: AccountInfo = {
+    ...accAGemFreeClaudeFull,
+    id: 'acc-c',
+    email: 'c@example.com',
+    sessionUsedPercent: 12,
+    weeklyUsedPercent: 20,
+    buckets: [
+      accAGemFreeClaudeFull.buckets[0]!,
+      {
+        group: 'Claude and GPT models',
+        sessionUsedPercent: 0,
+        sessionResetsAt: claude5hReset,
+        weeklyUsedPercent: 10,
+        weeklyResetsAt: claudeWeekReset
+      }
+    ]
+  }
+  assert.equal(pickBestAccount([accAGemFreeClaudeFull, accCTieClaudeFree], now)?.id, 'acc-c')
+
+  // 5) 状态栏对 Claude 5h=100% 但 Gemini 5h=12% 的激活号绝不误报 100% 红警，并在 tooltip 区分主/副池
+  const sb = computeStatusBar({
+    updatedAt: now,
+    accountsUpdatedAt: now - 60_000,
+    currentEmail: accAGemFreeClaudeFull.email,
+    activeAccountId: accAGemFreeClaudeFull.id,
+    selectedAccountId: accAGemFreeClaudeFull.id,
+    desiredEmail: accAGemFreeClaudeFull.email,
+    accounts: [{ ...accAGemFreeClaudeFull, isActive: true, isSelected: true }],
+    terminals: [],
+    outdatedCount: 0,
+    externalOutdatedCount: 0,
+    acpOutdatedCount: 0,
+    unknownAuthCount: 0,
+    queuedCount: 0,
+    workingPolicy: 'queue',
+    drift: null,
+    busy: false,
+    busyLabel: null,
+    scanDegradedReason: null,
+    lastOperation: null,
+    error: null
+  })
+  assert.equal(sb.tone, 'neutral')
+  assert.equal(sb.text, 'AGY:a 12%')
+  assert.ok(sb.tooltip.includes('Gemini 5h 12%'))
+  assert.ok(sb.tooltip.includes('周 20%'))
+  assert.ok(sb.tooltip.includes('Claude/GPT 5h 100% | 周 95%'))
+  assert.equal(sb.tooltip.includes('））'), false)
+  assert.ok(sb.text.length <= 64)
+  assert.ok(sb.tooltip.length <= 256)
+
+  // 6) parseAccountBuckets 结构化 windowMinutes/windowName 优先，不被 name 中的字样误判窗口
+  const structPriority = parseAccountBuckets([
+    {
+      name: 'Model-Week-Edition · 5h',
+      group: 'Model-Week-Edition',
+      windowName: 'Five Hour Limit Remaining',
+      windowMinutes: 300,
+      usedPercent: 33,
+      resetsAt: gem5hReset
+    }
+  ])
+  assert.equal(structPriority.length, 1)
+  assert.equal(structPriority[0]!.sessionUsedPercent, 33)
+  assert.equal(structPriority[0]!.weeklyUsedPercent, null)
+
+  // 7) 无 buckets 的老账号安全回退顶层字段，不贴错误池名
+  const legacyPrimary = resolvePrimaryQuota({
+    sessionUsedPercent: 15,
+    sessionResetsAt: gem5hReset,
+    weeklyUsedPercent: 30,
+    weeklyResetsAt: gemWeekReset,
+    buckets: []
+  })
+  assert.equal(legacyPrimary.name, null)
+  assert.equal(legacyPrimary.sessionUsedPercent, 15)
+  assert.equal(legacyPrimary.weeklyUsedPercent, 30)
+})
+
+test('[v0.2.8] quickSyncCommand 仅在主池 5h 满额时自动换号，不被副池 Claude/GPT 5h 100% 误触发', async () => {
+  const now = Date.now()
+  const future5h = now + 3 * 3600_000
+  const futureWeek = now + 5 * 86400_000
+  const sys = new FakeSystemAdapter({
+    accountState: {
+      activeAccountId: 'acc-1',
+      selectedAccountId: 'acc-1',
+      currentEmail: 'primary-ok@example.com',
+      accounts: [
+        {
+          id: 'acc-1',
+          email: 'primary-ok@example.com',
+          label: null,
+          status: 'ok',
+          // 顶层 100% 来自副池 Claude/GPT，主池 Gemini 仅 15%
+          sessionUsedPercent: 100,
+          sessionResetsAt: future5h,
+          weeklyUsedPercent: 93,
+          weeklyResetsAt: futureWeek,
+          buckets: [
+            {
+              group: 'Gemini Models',
+              sessionUsedPercent: 15,
+              sessionResetsAt: future5h,
+              weeklyUsedPercent: 28,
+              weeklyResetsAt: futureWeek
+            },
+            {
+              group: 'Claude and GPT models',
+              sessionUsedPercent: 100,
+              sessionResetsAt: future5h,
+              weeklyUsedPercent: 93,
+              weeklyResetsAt: futureWeek
+            }
+          ]
+        },
+        {
+          id: 'acc-2',
+          email: 'backup@example.com',
+          label: null,
+          status: 'ok',
+          sessionUsedPercent: 0,
+          sessionResetsAt: future5h,
+          weeklyUsedPercent: 5,
+          weeklyResetsAt: futureWeek,
+          buckets: [
+            {
+              group: 'Gemini Models',
+              sessionUsedPercent: 0,
+              sessionResetsAt: future5h,
+              weeklyUsedPercent: 5,
+              weeklyResetsAt: futureWeek
+            }
+          ]
+        }
+      ]
+    },
+    terminals: [],
+    agents: [],
+    processes: []
+  })
+
+  const host = mockHost({
+    settings: { workingPolicy: 'queue', notifyOnComplete: false },
+    results: { 'statusBar.update': { ok: true } }
+  })
+
+  let service!: SwitcherService
+  const worker = await mountWorker(
+    {
+      default(orca: OrcaWorkerApi) {
+        service = createWorker(orca, sys)
+      }
+    },
+    { host }
+  )
+
+  const msg = await service.quickSyncCommand()
+  assert.equal(sys.events.length, 0)
+  assert.ok(msg.includes('全部已同步'))
+
+  service.dispose()
+  await worker.deactivate()
 })

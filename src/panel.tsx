@@ -1,4 +1,4 @@
-// 反重力多账号一键切换 - Orca 原生 Components 侧边栏面板（异时快照诚实展示版 v0.2.6）：
+// 反重力多账号一键切换 - Orca 原生 Components 侧边栏面板（跨模型池精确隔离版 v0.2.8）：
 // - 先在下方选账号、再点上方闪电主按钮，且所有批量换号/同步操作均先展开影响预览确认框，杜绝误触惊吓；
 // - 原生 Chat 对话 1-on-1 按 ORCA_AGENT_SESSION_ID 匹配真实工作区/标题/状态，区分宿主 `agy` 与 Orca 托管独立引擎且绝不强杀；
 // - Tabs 分栏「账号 / 终端」，5h & 周额度双进度条 + 单账号快照时效 + 过期窗口诚实展示与未读新号手动解死锁。
@@ -38,8 +38,9 @@ import {
   isManagedChatTerminal,
   isQuotaWindowExpired,
   pickBestAccount,
-  shortBucketGroupName,
-  shortEmail
+  resolveAccountQuotaPools,
+  shortEmail,
+  type ResolvedQuotaPool
 } from './command-builder'
 import type { AccountInfo, AgyTerminalInfo, SwitcherSnapshot, WorkingPolicy } from './protocol'
 
@@ -188,26 +189,54 @@ function agentStateLabel(t: AgyTerminalInfo): {
   return { text: '空闲', tone: 'success' }
 }
 
-/** 提取除主池（Gemini）外的所有副模型池，识别各自窗口过期态，绝不让过期峰值永久标红或隐藏 0% 池。 */
-function secondaryPools(
-  account: AccountInfo,
-  nowMs: number
-): Array<{
+interface SecondaryPoolView {
+  key: string
   name: string
   summary: string
+  resetHint: string | null
   tone: 'neutral' | 'warning' | 'danger'
   hasUsage: boolean
-}> {
-  const buckets = account.buckets ?? []
-  const result: Array<{
-    name: string
-    summary: string
-    tone: 'neutral' | 'warning' | 'danger'
-    hasUsage: boolean
-  }> = []
-  for (const b of buckets) {
-    const name = shortBucketGroupName(b.group)
-    if (name === 'Gemini') continue
+}
+
+/** 格式化副池（如 Claude/GPT）活跃窗口的紧凑重置提示；全 0 或已过期返回 null 保持卡片极简。 */
+function formatSecondaryResetHint(
+  pool: ResolvedQuotaPool,
+  nowMs: number,
+  isActive: boolean
+): string | null {
+  const sExpired = isQuotaWindowExpired(pool.sessionResetsAt, nowMs)
+  const wExpired = isQuotaWindowExpired(pool.weeklyResetsAt, nowMs)
+  const sActive = !sExpired && pool.sessionUsedPercent !== null && pool.sessionUsedPercent > 0
+  const wActive = !wExpired && pool.weeklyUsedPercent !== null && pool.weeklyUsedPercent > 0
+
+  const sReset =
+    sActive && pool.sessionResetsAt !== null
+      ? formatResetCountdown(pool.sessionResetsAt, nowMs, 'short', { isActive })
+      : null
+  const wReset =
+    wActive && pool.weeklyResetsAt !== null
+      ? formatResetCountdown(pool.weeklyResetsAt, nowMs, 'short', { isActive })
+      : null
+
+  if (sReset && sReset !== '—' && wReset && wReset !== '—') {
+    const sDur = sReset.split(' · ')[0] ?? sReset
+    const wDur = wReset.split(' · ')[0] ?? wReset
+    return `5h重置 ${sDur} · 周重置 ${wDur}`
+  }
+  if (sReset && sReset !== '—') return `5h重置 ${sReset}`
+  if (wReset && wReset !== '—') return `周重置 ${wReset}`
+  return null
+}
+
+/** 将副模型池格式化为展示视图，识别各自窗口过期态，绝不让过期峰值永久标红或隐藏 0% 池。 */
+function formatSecondaryPools(
+  pools: readonly ResolvedQuotaPool[],
+  nowMs: number,
+  isActive: boolean
+): SecondaryPoolView[] {
+  const result: SecondaryPoolView[] = []
+  for (const b of pools) {
+    const name = b.name ?? b.bucketGroup ?? '其他'
     const s = b.sessionUsedPercent
     const w = b.weeklyUsedPercent
     if (s === null && w === null) continue
@@ -217,8 +246,10 @@ function secondaryPools(
     const wTxt = wExpired ? '已过重置' : w === null ? '—' : `${clampPercent(w)}%`
     const activeMaxPct = Math.max(sExpired ? 0 : (s ?? 0), wExpired ? 0 : (w ?? 0))
     result.push({
+      key: b.bucketGroup ?? name,
       name,
       summary: `5h ${sTxt} · 周 ${wTxt}`,
+      resetHint: formatSecondaryResetHint(b, nowMs, isActive),
       tone: quotaTextTone(activeMaxPct),
       hasUsage: activeMaxPct > 0
     })
@@ -254,10 +285,11 @@ function AccountRow(
   locked: boolean,
   selectedTargetId: string | null
 ) {
-  const sessionPct = account.sessionUsedPercent
-  const weeklyPct = account.weeklyUsedPercent
-  const sessionExpired = isQuotaWindowExpired(account.sessionResetsAt, snap.updatedAt)
-  const weeklyExpired = isQuotaWindowExpired(account.weeklyResetsAt, snap.updatedAt)
+  const { primary, secondary } = resolveAccountQuotaPools(account)
+  const sessionPct = primary.sessionUsedPercent
+  const weeklyPct = primary.weeklyUsedPercent
+  const sessionExpired = isQuotaWindowExpired(primary.sessionResetsAt, snap.updatedAt)
+  const weeklyExpired = isQuotaWindowExpired(primary.weeklyResetsAt, snap.updatedAt)
   const allOutdated = snap.outdatedCount + snap.externalOutdatedCount + snap.acpOutdatedCount
   const isCurrentAndAllClean =
     account.isActive &&
@@ -271,14 +303,14 @@ function AccountRow(
   const isErrorAccount = isAccountError(account)
   const isDraftSelected = selectedTargetId === account.id
 
-  const sessionReset = formatResetCountdown(account.sessionResetsAt, snap.updatedAt, 'short', {
+  const sessionReset = formatResetCountdown(primary.sessionResetsAt, snap.updatedAt, 'short', {
     isActive: account.isActive
   })
-  const weeklyReset = formatResetCountdown(account.weeklyResetsAt, snap.updatedAt, 'short', {
+  const weeklyReset = formatResetCountdown(primary.weeklyResetsAt, snap.updatedAt, 'short', {
     isActive: account.isActive
   })
-  const extraPools = secondaryPools(account, snap.updatedAt)
-  const primaryPrefix = extraPools.length > 0 ? 'Gemini ' : ''
+  const extraPools = formatSecondaryPools(secondary, snap.updatedAt, account.isActive)
+  const primaryPrefix = primary.name && extraPools.length > 0 ? `${primary.name} ` : ''
 
   const statusMeta = [
     account.isActive ? '当前' : null,
@@ -387,21 +419,30 @@ function AccountRow(
         </>
       )}
 
-      {/* 副模型池（如 Claude/GPT）：每个有该池的账号均清晰单行展示，绝不因 0% 隐藏 */}
+      {/* 副模型池（如 Claude/GPT）：每个有该池的账号均清晰展示，绝不因 0% 隐藏；有活跃用量时附紧凑重置倒计时 */}
       {extraPools.map((pool) => (
-        <Row key={pool.name} justify="between" align="center" gap="xs">
-          <Text muted size="xs">
-            {pool.name}
-          </Text>
-          <Text
-            size="xs"
-            muted={!pool.hasUsage}
-            weight={pool.hasUsage ? 'medium' : 'regular'}
-            tone={pool.tone}
-          >
-            {pool.summary}
-          </Text>
-        </Row>
+        <Stack key={pool.key} gap="none">
+          <Row justify="between" align="center" gap="xs">
+            <Text muted size="xs">
+              {pool.name}
+            </Text>
+            <Text
+              size="xs"
+              muted={!pool.hasUsage}
+              weight={pool.hasUsage ? 'medium' : 'regular'}
+              tone={pool.tone}
+            >
+              {pool.summary}
+            </Text>
+          </Row>
+          {pool.resetHint ? (
+            <Row justify="end">
+              <Text muted size="xs">
+                {pool.resetHint}
+              </Text>
+            </Row>
+          ) : null}
+        </Stack>
       ))}
 
       {/* 底部行：左（可选别名邮箱 + 快照龄），右（纯选中/取消选中目标，未读/异常号亦开放手动切入） */}
@@ -618,18 +659,22 @@ function SwitchConfirmBox(
   }
 
   const impact = computeSwitchImpact(snap, target.email, snap.workingPolicy)
-  const sPct = target.sessionUsedPercent
-  const wPct = target.weeklyUsedPercent
+  const { primary, secondary } = resolveAccountQuotaPools(target)
+  const sPct = primary.sessionUsedPercent
+  const wPct = primary.weeklyUsedPercent
   const sTxt = sPct === null ? '—' : `${clampPercent(sPct)}%`
   const wTxt = wPct === null ? '—' : `${clampPercent(wPct)}%`
-  const sessionExpired = isQuotaWindowExpired(target.sessionResetsAt, snap.updatedAt)
-  const weeklyExpired = isQuotaWindowExpired(target.weeklyResetsAt, snap.updatedAt)
+  const sessionExpired = isQuotaWindowExpired(primary.sessionResetsAt, snap.updatedAt)
+  const weeklyExpired = isQuotaWindowExpired(primary.weeklyResetsAt, snap.updatedAt)
   const isUnfetched = isAccountUnfetched(target)
   const isErrorAccount = isAccountError(target)
   const snapshotAge = !target.isActive ? formatSnapshotAge(target.usageUpdatedAt, snap.updatedAt) : null
   const isFull5h = !sessionExpired && sPct !== null && sPct >= 100
   const isForceRisk = impact.forcedBusyCount > 0
   const manualCliCount = impact.externalCount + impact.blockedCount
+  const activeSecondaryPools = formatSecondaryPools(secondary, snap.updatedAt, target.isActive).filter(
+    (p) => p.hasUsage
+  )
 
   const title =
     confirm.mode === 'best'
@@ -682,7 +727,8 @@ function SwitchConfirmBox(
         : '已过重置'
       : wTxt
     const ageSuffix = snapshotAge ? ` · ${snapshotAge}快照` : ''
-    targetQuotaSummary = `目标：${target.email}（Gemini 5h ${sPart} · 周 ${wPart}${ageSuffix}）${isFull5h ? ' ⚠ 5h已满' : ''}`
+    const poolPrefix = primary.name ? `${primary.name} ` : ''
+    targetQuotaSummary = `目标：${target.email}（${poolPrefix}5h ${sPart} · 周 ${wPart}${ageSuffix}）${isFull5h ? ' ⚠ 5h已满' : ''}`
   }
 
   return (
@@ -693,6 +739,16 @@ function SwitchConfirmBox(
     >
       <Stack gap="xs">
         <Text size="xs">{targetQuotaSummary}</Text>
+        {activeSecondaryPools.map((p) => (
+          <Text
+            key={p.key}
+            size="xs"
+            muted={p.tone === 'neutral'}
+            tone={p.tone === 'neutral' ? undefined : p.tone}
+          >
+            {`${p.name} ${p.summary}`}
+          </Text>
+        ))}
         {confirm.mode === 'best' && (sessionExpired || weeklyExpired) ? (
           <Text size="xs" muted>
             注：基于旧快照推算（原窗口已过重置），切入后将实时刷新该账号真实额度。

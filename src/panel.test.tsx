@@ -28,7 +28,7 @@ function makeSnapshot(overrides: Partial<SwitcherSnapshot> = {}): SwitcherSnapsh
           {
             group: 'Gemini Models',
             sessionUsedPercent: 100,
-            sessionResetsAt: now - 60_000,
+            sessionResetsAt: now + 3600_000,
             weeklyUsedPercent: 68,
             weeklyResetsAt: now + (5 * 24 + 18) * 3600_000 + 14 * 60_000
           }
@@ -455,6 +455,119 @@ test('过期旧快照去红警并标注快照时间、副池识别过期、未�
   await view.press({ type: 'Button', text: '切到 broken 并同步' })
   assert.ok(view.find({ text: /上次读取额度异常/ }))
   assert.ok(view.find({ type: 'Button', text: '仍要切入' }))
+  await view.press({ type: 'Button', text: '取消' })
+
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.refusals, [])
+  await view.unmount()
+})
+
+test('跨模型池隔离：顶层汇总为 Claude/GPT 93% 时，Gemini 周与确认框严格展示 Gemini 28% 且副池带重置倒计时', async () => {
+  const now = new Date(2026, 10, 24, 23, 0, 0).getTime()
+  const gem5hReset = now + (2 * 60 + 35) * 60_000
+  const gemWeekReset = now + ((6 * 24 + 5) * 60 + 10) * 60_000
+  const claudeWeekReset = now + ((4 * 24 + 16) * 60 + 14) * 60_000
+  const claude5hReset = now + 4 * 3600_000
+
+  const snap = makeSnapshot({
+    updatedAt: now,
+    accountsUpdatedAt: now - 120_000,
+    currentEmail: 'alice@example.com',
+    activeAccountId: 'acc-active',
+    selectedAccountId: 'acc-active',
+    desiredEmail: 'alice@example.com',
+    outdatedCount: 0,
+    terminals: [],
+    accounts: [
+      {
+        id: 'acc-active',
+        email: 'alice@example.com',
+        label: null,
+        isActive: true,
+        isSelected: true,
+        status: 'ok',
+        // 模拟 Orca 顶层跨池取最严汇总：5h 来自 Gemini (48%)，周来自 Claude/GPT (93%)
+        sessionUsedPercent: 48,
+        sessionResetsAt: gem5hReset,
+        weeklyUsedPercent: 93,
+        weeklyResetsAt: claudeWeekReset,
+        buckets: [
+          {
+            group: 'Gemini Models',
+            sessionUsedPercent: 48,
+            sessionResetsAt: gem5hReset,
+            weeklyUsedPercent: 28,
+            weeklyResetsAt: gemWeekReset
+          },
+          {
+            group: 'Claude and GPT models',
+            sessionUsedPercent: 0,
+            sessionResetsAt: claude5hReset,
+            weeklyUsedPercent: 93,
+            weeklyResetsAt: claudeWeekReset
+          }
+        ],
+        terminalCount: 2,
+        usageUpdatedAt: now - 120_000
+      },
+      {
+        id: 'acc-claude-full',
+        email: 'dana@example.com',
+        label: null,
+        isActive: false,
+        isSelected: false,
+        status: 'ok',
+        // 反向串值测试：顶层 session 为 100%（Claude 5h 满），但 Gemini 5h 仅 18%
+        sessionUsedPercent: 100,
+        sessionResetsAt: claude5hReset,
+        weeklyUsedPercent: 90,
+        weeklyResetsAt: claudeWeekReset,
+        buckets: [
+          {
+            group: 'Gemini Models',
+            sessionUsedPercent: 18,
+            sessionResetsAt: gem5hReset,
+            weeklyUsedPercent: 22,
+            weeklyResetsAt: gemWeekReset
+          },
+          {
+            group: 'Claude and GPT models',
+            sessionUsedPercent: 100,
+            sessionResetsAt: claude5hReset,
+            weeklyUsedPercent: 90,
+            weeklyResetsAt: claudeWeekReset
+          }
+        ],
+        terminalCount: 0,
+        usageUpdatedAt: now - 600_000
+      }
+    ]
+  })
+
+  const host = mockHost({
+    requests: {
+      'switcher.getState': () => snap
+    }
+  })
+  const view = await mount(panel, { host })
+
+  // 1) 主池必须严格显示 Gemini 周 28%（6天5时），绝不能把 Claude/GPT 周 93% 错标为 Gemini 周 93%
+  assert.ok(view.find({ text: 'Gemini 5h 48%' }))
+  assert.ok(view.find({ text: 'Gemini 周 28%' }))
+  assert.ok(view.find({ text: /6天5时10分/ }))
+  assert.equal(view.findAll({ text: /Gemini 周 93%/ }).length, 0)
+
+  // 2) 副池清晰展示 5h 0% · 周 93% 以及自己的周重置倒计时
+  assert.ok(view.find({ text: 'Claude/GPT' }))
+  assert.ok(view.find({ text: '5h 0% · 周 93%' }))
+  assert.ok(view.find({ text: /周重置\s+4天16时14分/ }))
+
+  // 3) 选中 Claude 5h=100% 但 Gemini 5h=18% 的账号展开确认框：不误报 5h已满，且分别展示主池与副池
+  await view.press({ type: 'Button', text: '选择' })
+  await view.press({ type: 'Button', text: '切到 dana 并同步' })
+  assert.ok(view.find({ text: /Gemini 5h 18% · 周 22%/ }))
+  assert.equal(view.findAll({ text: /5h已满/ }).length, 0)
+  assert.ok(view.find({ text: /Claude\/GPT 5h 100% · 周 90%/ }))
   await view.press({ type: 'Button', text: '取消' })
 
   assert.deepEqual(view.errors, [])

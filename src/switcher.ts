@@ -12,6 +12,7 @@ import {
   isManagedChatTerminal,
   isQuotaWindowExpired,
   pickBestAccount,
+  resolvePrimaryQuota,
   shortEmail
 } from './command-builder'
 import type {
@@ -1378,11 +1379,13 @@ export class SwitcherService {
         return
       }
       const active = snap.accounts.find((a) => a.isActive)
+      const activePrimary = active ? resolvePrimaryQuota(active) : null
       if (
         active &&
-        !isQuotaWindowExpired(active.sessionResetsAt, snap.updatedAt) &&
-        typeof active.sessionUsedPercent === 'number' &&
-        active.sessionUsedPercent >= 100
+        activePrimary &&
+        !isQuotaWindowExpired(activePrimary.sessionResetsAt, snap.updatedAt) &&
+        typeof activePrimary.sessionUsedPercent === 'number' &&
+        activePrimary.sessionUsedPercent >= 100
       ) {
         const best = pickBestAccount(snap.accounts, snap.updatedAt)
         if (best && best.id !== active.id) {

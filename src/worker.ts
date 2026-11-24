@@ -170,13 +170,22 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     })
   )
 
-  await service.refreshSnapshot({ refreshAccounts: true }).catch((err) => {
-    orca.log(`initial refreshSnapshot failed: ${err instanceof Error ? err.message : String(err)}`)
-  })
-  // 若激活期间已被 deactivate，绝不启动僵尸轮询
-  if (gen === pollGeneration && !service.isDisposed()) {
-    await scheduleNextTick(gen)
-  }
+  // 非阻塞触发首次远程额度拉取：orca account list 在慢网下可能耗时 >10s，
+  // 绝不能阻塞 activate() 触发 Orca 宿主 10s Worker 启动超时重启；
+  // 面板在初始化期间发起的 getState 会通过 inFlightRefresh singleflight 自动复用本次拉取。
+  void service
+    .refreshSnapshot({ refreshAccounts: true })
+    .catch((err) => {
+      orca.log(`initial refreshSnapshot failed: ${err instanceof Error ? err.message : String(err)}`)
+    })
+    .finally(() => {
+      // 若激活期间已被 deactivate，绝不启动僵尸轮询
+      if (gen === pollGeneration && !service.isDisposed()) {
+        void scheduleNextTick(gen).catch((err) =>
+          orca.log(`initial scheduleNextTick failed: ${err instanceof Error ? err.message : String(err)}`)
+        )
+      }
+    })
 }
 
 export function deactivate(): void {

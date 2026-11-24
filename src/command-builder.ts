@@ -1,5 +1,5 @@
 // 纯函数工具：邮箱规范化、命令分类、白名单安全命令重构、最优账号选择、状态栏展示计算。
-import type { AccountInfo, SwitcherSnapshot, WorkingPolicy } from './protocol'
+import type { AccountBucketGroup, AccountInfo, SwitcherSnapshot, WorkingPolicy } from './protocol'
 
 // 不允许以 `=` 开头（防止 zsh EQUALS 扩展将 `=cmd` 展开成路径）
 const SAFE_TOKEN_RE = /^[A-Za-z0-9_@%+:,.\/-][A-Za-z0-9_@%+=:,./-]*$/
@@ -434,6 +434,98 @@ export function shortBucketGroupName(group: string): string {
   return group.replace(/\s*models$/i, '').trim() || group
 }
 
+export interface ResolvedQuotaPool {
+  /** 精简模型池名（如 `Gemini`、`Claude/GPT`）；无独立 bucket 回退顶层汇总时为 null。 */
+  name: string | null
+  /** 原始 bucket 分组名；回退顶层汇总时为 null。 */
+  bucketGroup: string | null
+  sessionUsedPercent: number | null
+  sessionResetsAt: number | null
+  weeklyUsedPercent: number | null
+  weeklyResetsAt: number | null
+}
+
+export interface AccountQuotaPools {
+  primary: ResolvedQuotaPool
+  secondary: ResolvedQuotaPool[]
+}
+
+type QuotaCapableAccount = Pick<
+  AccountInfo,
+  'sessionUsedPercent' | 'sessionResetsAt' | 'weeklyUsedPercent' | 'weeklyResetsAt' | 'buckets'
+>
+
+function hasBucketQuotaData(b: AccountBucketGroup): boolean {
+  return (
+    b.sessionUsedPercent !== null ||
+    b.weeklyUsedPercent !== null ||
+    b.sessionResetsAt !== null ||
+    b.weeklyResetsAt !== null
+  )
+}
+
+/**
+ * 统一解析账号的主模型池与副模型池：
+ * - Orca 顶层 `usage.session` / `usage.weekly` 是跨池聚合的最紧张窗口（例如 Gemini 周 28% + Claude/GPT 周 93% 时顶层周为 93%），
+ *   严禁直接将顶层汇总字段当成 Gemini 池展示或参与主池判满；
+ * - 优先从 `buckets` 提取 `Gemini` 池作为主池（其余非主池归入 `secondary`）；
+ * - 若不存在 Gemini 池但存在其他有效 bucket，则选首个有效 bucket 为主池；
+ * - 仅当账号无任何有效 bucket 时，回退使用顶层汇总字段且不贴 `Gemini` 前缀。
+ */
+export function resolveAccountQuotaPools(account: QuotaCapableAccount): AccountQuotaPools {
+  const buckets = account.buckets ?? []
+  let primaryIdx = buckets.findIndex(
+    (b) => shortBucketGroupName(b.group) === 'Gemini' && hasBucketQuotaData(b)
+  )
+  if (primaryIdx < 0) {
+    primaryIdx = buckets.findIndex((b) => hasBucketQuotaData(b))
+  }
+
+  if (primaryIdx >= 0) {
+    const primaryBucket = buckets[primaryIdx]!
+    const primary: ResolvedQuotaPool = {
+      name: shortBucketGroupName(primaryBucket.group),
+      bucketGroup: primaryBucket.group,
+      sessionUsedPercent: primaryBucket.sessionUsedPercent,
+      sessionResetsAt: primaryBucket.sessionResetsAt,
+      weeklyUsedPercent: primaryBucket.weeklyUsedPercent,
+      weeklyResetsAt: primaryBucket.weeklyResetsAt
+    }
+    const secondary: ResolvedQuotaPool[] = []
+    for (let i = 0; i < buckets.length; i++) {
+      if (i === primaryIdx) continue
+      const b = buckets[i]!
+      if (!hasBucketQuotaData(b)) continue
+      secondary.push({
+        name: shortBucketGroupName(b.group),
+        bucketGroup: b.group,
+        sessionUsedPercent: b.sessionUsedPercent,
+        sessionResetsAt: b.sessionResetsAt,
+        weeklyUsedPercent: b.weeklyUsedPercent,
+        weeklyResetsAt: b.weeklyResetsAt
+      })
+    }
+    return { primary, secondary }
+  }
+
+  return {
+    primary: {
+      name: null,
+      bucketGroup: null,
+      sessionUsedPercent: account.sessionUsedPercent,
+      sessionResetsAt: account.sessionResetsAt,
+      weeklyUsedPercent: account.weeklyUsedPercent,
+      weeklyResetsAt: account.weeklyResetsAt
+    },
+    secondary: []
+  }
+}
+
+/** 提取账号的主模型池额度（有分池时严格取 Gemini/主池 bucket，杜绝跨池汇总串值）。 */
+export function resolvePrimaryQuota(account: QuotaCapableAccount): ResolvedQuotaPool {
+  return resolveAccountQuotaPools(account).primary
+}
+
 /** 账号是否为 Orca 刚添加、尚未切入读取过额度的新号。 */
 export function isAccountUnfetched(account: Pick<AccountInfo, 'status'>): boolean {
   return account.status === 'unfetched'
@@ -455,11 +547,28 @@ function effectiveWindowScore(
   return { effectivePct: usedPercent ?? 100, estimatedByExpiry: false }
 }
 
+function secondaryMaxEffectivePct(
+  pools: readonly ResolvedQuotaPool[],
+  window: 'session' | 'weekly',
+  nowMs: number
+): number {
+  let maxPct = 0
+  for (const p of pools) {
+    const rawPct = window === 'session' ? p.sessionUsedPercent : p.weeklyUsedPercent
+    const resetsAt = window === 'session' ? p.sessionResetsAt : p.weeklyResetsAt
+    if (rawPct === null) continue
+    const score = effectiveWindowScore(rawPct, resetsAt, nowMs)
+    if (score.effectivePct > maxPct) maxPct = score.effectivePct
+  }
+  return maxPct
+}
+
 /**
  * 按真实可用余量排序比较两个账号：
  * - 状态分层：健康(`ok`) < 未读取(`unfetched`) < 异常(`error`/其他)；
+ * - 优先按主模型池（Gemini，无分池时回退顶层）5h -> 周有效使用率比较，绝不被副池（如 Claude/GPT）高占用误判主池已满；
  * - 已过重置点的窗口在排序时按有效 0% 估算（不被过期的 100% 死缓存卡死），但同为 0% 时实测未过期者严格优先；
- * - 同等情况下优先周额度更充裕者，再优先当前激活号。
+ * - 主池完全打平时再比较副池余量，最后优先当前激活号。
  */
 export function compareAccountsByHeadroom(
   a: AccountInfo,
@@ -471,12 +580,31 @@ export function compareAccountsByHeadroom(
   const rankDiff = statusRank(a) - statusRank(b)
   if (rankDiff !== 0) return rankDiff
 
-  const aSess = effectiveWindowScore(a.sessionUsedPercent, a.sessionResetsAt, nowMs)
-  const bSess = effectiveWindowScore(b.sessionUsedPercent, b.sessionResetsAt, nowMs)
+  const aPools = resolveAccountQuotaPools(a)
+  const bPools = resolveAccountQuotaPools(b)
+
+  const aSess = effectiveWindowScore(
+    aPools.primary.sessionUsedPercent,
+    aPools.primary.sessionResetsAt,
+    nowMs
+  )
+  const bSess = effectiveWindowScore(
+    bPools.primary.sessionUsedPercent,
+    bPools.primary.sessionResetsAt,
+    nowMs
+  )
   if (aSess.effectivePct !== bSess.effectivePct) return aSess.effectivePct - bSess.effectivePct
 
-  const aWeek = effectiveWindowScore(a.weeklyUsedPercent, a.weeklyResetsAt, nowMs)
-  const bWeek = effectiveWindowScore(b.weeklyUsedPercent, b.weeklyResetsAt, nowMs)
+  const aWeek = effectiveWindowScore(
+    aPools.primary.weeklyUsedPercent,
+    aPools.primary.weeklyResetsAt,
+    nowMs
+  )
+  const bWeek = effectiveWindowScore(
+    bPools.primary.weeklyUsedPercent,
+    bPools.primary.weeklyResetsAt,
+    nowMs
+  )
   if (aWeek.effectivePct !== bWeek.effectivePct) return aWeek.effectivePct - bWeek.effectivePct
 
   const sessEstDiff = Number(aSess.estimatedByExpiry) - Number(bSess.estimatedByExpiry)
@@ -485,11 +613,23 @@ export function compareAccountsByHeadroom(
   const weekEstDiff = Number(aWeek.estimatedByExpiry) - Number(bWeek.estimatedByExpiry)
   if (weekEstDiff !== 0) return weekEstDiff
 
-  const rawSessDiff = (a.sessionUsedPercent ?? 100) - (b.sessionUsedPercent ?? 100)
+  const rawSessDiff =
+    (aPools.primary.sessionUsedPercent ?? 100) - (bPools.primary.sessionUsedPercent ?? 100)
   if (rawSessDiff !== 0) return rawSessDiff
 
-  const rawWeekDiff = (a.weeklyUsedPercent ?? 100) - (b.weeklyUsedPercent ?? 100)
+  const rawWeekDiff =
+    (aPools.primary.weeklyUsedPercent ?? 100) - (bPools.primary.weeklyUsedPercent ?? 100)
   if (rawWeekDiff !== 0) return rawWeekDiff
+
+  const secSessDiff =
+    secondaryMaxEffectivePct(aPools.secondary, 'session', nowMs) -
+    secondaryMaxEffectivePct(bPools.secondary, 'session', nowMs)
+  if (secSessDiff !== 0) return secSessDiff
+
+  const secWeekDiff =
+    secondaryMaxEffectivePct(aPools.secondary, 'weekly', nowMs) -
+    secondaryMaxEffectivePct(bPools.secondary, 'weekly', nowMs)
+  if (secWeekDiff !== 0) return secWeekDiff
 
   if (a.isActive !== b.isActive) return a.isActive ? -1 : 1
   return a.email.localeCompare(b.email)
@@ -577,30 +717,53 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
     snapshot.accounts.find((a) => a.isActive) ??
     snapshot.accounts.find((a) => emailsEqual(a.email, snapshot.currentEmail)) ??
     null
+  const activePools = active ? resolveAccountQuotaPools(active) : null
+  const primary = activePools?.primary ?? null
+  const secondary = activePools?.secondary ?? []
   const name = shortEmail(active?.email ?? snapshot.currentEmail)
-  const used = active?.sessionUsedPercent
-  const activeSessionExpired = isQuotaWindowExpired(active?.sessionResetsAt, snapshot.updatedAt)
-  const activeWeeklyExpired = isQuotaWindowExpired(active?.weeklyResetsAt, snapshot.updatedAt)
+  const used = primary?.sessionUsedPercent
+  const activeSessionExpired = isQuotaWindowExpired(primary?.sessionResetsAt, snapshot.updatedAt)
+  const activeWeeklyExpired = isQuotaWindowExpired(primary?.weeklyResetsAt, snapshot.updatedAt)
   const usedLabel = activeSessionExpired
     ? '待刷新'
     : typeof used === 'number'
       ? `${used}%`
       : '?'
 
-  const sessionResetStr = formatResetCountdown(active?.sessionResetsAt, snapshot.updatedAt, 'full', {
+  const sessionResetStr = formatResetCountdown(primary?.sessionResetsAt, snapshot.updatedAt, 'short', {
     isActive: true
   })
-  const weeklyResetStr = formatResetCountdown(active?.weeklyResetsAt, snapshot.updatedAt, 'full', {
+  const weeklyResetStr = formatResetCountdown(primary?.weeklyResetsAt, snapshot.updatedAt, 'short', {
     isActive: true
   })
+  const poolPrefix = primary?.name && secondary.length > 0 ? `${primary.name} ` : ''
   const sessionDetail = activeSessionExpired
-    ? `5h 已过重置${typeof used === 'number' ? `·上轮${used}%` : ''}（待刷新）`
-    : `5h ${usedLabel}（${sessionResetStr}）`
+    ? `${poolPrefix}5h 已过重置${typeof used === 'number' ? `·上轮${used}%` : ''}（待刷新）`
+    : `${poolPrefix}5h ${usedLabel}（${sessionResetStr}）`
   const weeklyPctStr =
-    typeof active?.weeklyUsedPercent === 'number' ? `${active.weeklyUsedPercent}%` : '?'
+    typeof primary?.weeklyUsedPercent === 'number' ? `${primary.weeklyUsedPercent}%` : '?'
   const weeklyDetail = activeWeeklyExpired
-    ? `周 已过重置${typeof active?.weeklyUsedPercent === 'number' ? `·上轮${active.weeklyUsedPercent}%` : ''}（待刷新）`
+    ? `周 已过重置${typeof primary?.weeklyUsedPercent === 'number' ? `·上轮${primary.weeklyUsedPercent}%` : ''}（待刷新）`
     : `周 ${weeklyPctStr}（${weeklyResetStr}）`
+  const secondarySummaryLines: string[] = []
+  for (const pool of secondary) {
+    const sExp = isQuotaWindowExpired(pool.sessionResetsAt, snapshot.updatedAt)
+    const wExp = isQuotaWindowExpired(pool.weeklyResetsAt, snapshot.updatedAt)
+    const sActive = !sExp && typeof pool.sessionUsedPercent === 'number' && pool.sessionUsedPercent > 0
+    const wActive = !wExp && typeof pool.weeklyUsedPercent === 'number' && pool.weeklyUsedPercent > 0
+    if (!sActive && !wActive) continue
+    const sTxt = sExp
+      ? '已过重置'
+      : typeof pool.sessionUsedPercent === 'number'
+        ? `${pool.sessionUsedPercent}%`
+        : '—'
+    const wTxt = wExp
+      ? '已过重置'
+      : typeof pool.weeklyUsedPercent === 'number'
+        ? `${pool.weeklyUsedPercent}%`
+        : '—'
+    secondarySummaryLines.push(`${pool.name ?? '其他'} 5h ${sTxt} | 周 ${wTxt}`)
+  }
   const managedChatsCount = snapshot.terminals.filter((t) => isManagedChatTerminal(t)).length
   const procSummary =
     managedChatsCount > 0
@@ -610,6 +773,7 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
   const tooltipLines: string[] = [
     `反重力 (AGY) 当前账号：${active?.email ?? snapshot.currentEmail ?? '未知'}`,
     `${sessionDetail} | ${weeklyDetail}`,
+    ...secondarySummaryLines,
     procSummary
   ]
 
