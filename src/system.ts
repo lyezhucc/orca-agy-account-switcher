@@ -367,6 +367,87 @@ interface LogCacheEntry {
   email: string | null
 }
 
+export interface RawUsageBucketInput {
+  name?: string | null
+  group?: string | null
+  windowName?: string | null
+  windowMinutes?: number | null
+  usedPercent?: number | null
+  resetsAt?: number | null
+}
+
+/**
+ * 将 Orca `usage.buckets` 按模型池分组汇总为独立的 5h / 周窗口，
+ * 避免与顶层跨池汇总字段（`usage.session` / `usage.weekly`）混用导致池间串值。
+ */
+export function parseAccountBuckets(
+  buckets: readonly RawUsageBucketInput[] | null | undefined
+): AccountBucketGroup[] {
+  const groupMap = new Map<string, AccountBucketGroup>()
+  for (const b of buckets ?? []) {
+    const fallbackGroup = b.name?.split('·')[0]?.trim()
+    const groupName = b.group?.trim() || fallbackGroup
+    if (!groupName) continue
+    let item = groupMap.get(groupName)
+    if (!item) {
+      item = {
+        group: groupName,
+        sessionUsedPercent: null,
+        sessionResetsAt: null,
+        weeklyUsedPercent: null,
+        weeklyResetsAt: null
+      }
+      groupMap.set(groupName, item)
+    }
+    // 优先使用结构化字段 windowMinutes / windowName 判定窗口类型，仅在均缺省时兜底解析 name，避免模型名误匹配
+    const winNameLower = (b.windowName ?? '').toLowerCase()
+    const fullNameLower = (b.name ?? '').toLowerCase()
+    const isWeeklyByStruct =
+      (typeof b.windowMinutes === 'number' && Number.isFinite(b.windowMinutes) && b.windowMinutes >= 1440) ||
+      winNameLower.includes('weekly') ||
+      winNameLower.includes('week') ||
+      winNameLower.includes('7d')
+    const isFiveHourByStruct =
+      !isWeeklyByStruct &&
+      ((typeof b.windowMinutes === 'number' &&
+        Number.isFinite(b.windowMinutes) &&
+        b.windowMinutes > 0 &&
+        b.windowMinutes < 1440) ||
+        winNameLower.includes('five hour') ||
+        winNameLower.includes('5 hour') ||
+        winNameLower.includes('5h'))
+    const isWeekly =
+      isWeeklyByStruct ||
+      (!isFiveHourByStruct &&
+        (fullNameLower.includes('weekly') ||
+          fullNameLower.includes('week') ||
+          fullNameLower.includes('7d')))
+    const isFiveHour =
+      isFiveHourByStruct ||
+      (!isWeekly &&
+        (fullNameLower.includes('five hour') ||
+          fullNameLower.includes('5 hour') ||
+          fullNameLower.includes('5h')))
+
+    if (isWeekly) {
+      if (typeof b.usedPercent === 'number' && Number.isFinite(b.usedPercent)) {
+        item.weeklyUsedPercent = b.usedPercent
+      }
+      if (typeof b.resetsAt === 'number' && Number.isFinite(b.resetsAt)) {
+        item.weeklyResetsAt = b.resetsAt
+      }
+    } else if (isFiveHour) {
+      if (typeof b.usedPercent === 'number' && Number.isFinite(b.usedPercent)) {
+        item.sessionUsedPercent = b.usedPercent
+      }
+      if (typeof b.resetsAt === 'number' && Number.isFinite(b.resetsAt)) {
+        item.sessionResetsAt = b.resetsAt
+      }
+    }
+  }
+  return [...groupMap.values()]
+}
+
 export class RealSystemAdapter implements SystemAdapter {
   private readonly orcaBin = resolveOrcaBin()
   private readonly logEmailCache = new Map<string, LogCacheEntry>()
@@ -417,13 +498,7 @@ export class RealSystemAdapter implements SystemAdapter {
               updatedAt?: number | null
               session?: { usedPercent?: number | null; resetsAt?: number | null } | null
               weekly?: { usedPercent?: number | null; resetsAt?: number | null } | null
-              buckets?: Array<{
-                group?: string | null
-                windowName?: string | null
-                windowMinutes?: number | null
-                usedPercent?: number | null
-                resetsAt?: number | null
-              }> | null
+              buckets?: Array<RawUsageBucketInput> | null
             } | null
           }>
         }
@@ -442,37 +517,7 @@ export class RealSystemAdapter implements SystemAdapter {
     }
 
     const accounts: RawOrcaAccount[] = (ag.accounts ?? []).map((a) => {
-      const groupMap = new Map<string, AccountBucketGroup>()
-      for (const b of a.usage?.buckets ?? []) {
-        const groupName = b.group?.trim()
-        if (!groupName) continue
-        let item = groupMap.get(groupName)
-        if (!item) {
-          item = {
-            group: groupName,
-            sessionUsedPercent: null,
-            sessionResetsAt: null,
-            weeklyUsedPercent: null,
-            weeklyResetsAt: null
-          }
-          groupMap.set(groupName, item)
-        }
-        const winLower = (b.windowName ?? '').toLowerCase()
-        const isWeekly =
-          winLower.includes('weekly') || (typeof b.windowMinutes === 'number' && b.windowMinutes >= 1440)
-        const isFiveHour =
-          winLower.includes('five hour') ||
-          winLower.includes('5 hour') ||
-          (typeof b.windowMinutes === 'number' && b.windowMinutes > 0 && b.windowMinutes < 1440)
-
-        if (isWeekly) {
-          if (typeof b.usedPercent === 'number') item.weeklyUsedPercent = b.usedPercent
-          if (typeof b.resetsAt === 'number') item.weeklyResetsAt = b.resetsAt
-        } else if (isFiveHour) {
-          if (typeof b.usedPercent === 'number') item.sessionUsedPercent = b.usedPercent
-          if (typeof b.resetsAt === 'number') item.sessionResetsAt = b.resetsAt
-        }
-      }
+      const buckets = parseAccountBuckets(a.usage?.buckets)
 
       const hasUsageObject = a.usage != null
       const status = hasUsageObject ? (a.usage?.status ?? 'unknown') : 'unfetched'
@@ -487,14 +532,26 @@ export class RealSystemAdapter implements SystemAdapter {
         label: a.label ?? null,
         status,
         sessionUsedPercent:
-          typeof a.usage?.session?.usedPercent === 'number' ? a.usage.session.usedPercent : null,
+          typeof a.usage?.session?.usedPercent === 'number' &&
+          Number.isFinite(a.usage.session.usedPercent)
+            ? a.usage.session.usedPercent
+            : null,
         sessionResetsAt:
-          typeof a.usage?.session?.resetsAt === 'number' ? a.usage.session.resetsAt : null,
+          typeof a.usage?.session?.resetsAt === 'number' &&
+          Number.isFinite(a.usage.session.resetsAt)
+            ? a.usage.session.resetsAt
+            : null,
         weeklyUsedPercent:
-          typeof a.usage?.weekly?.usedPercent === 'number' ? a.usage.weekly.usedPercent : null,
+          typeof a.usage?.weekly?.usedPercent === 'number' &&
+          Number.isFinite(a.usage.weekly.usedPercent)
+            ? a.usage.weekly.usedPercent
+            : null,
         weeklyResetsAt:
-          typeof a.usage?.weekly?.resetsAt === 'number' ? a.usage.weekly.resetsAt : null,
-        buckets: [...groupMap.values()],
+          typeof a.usage?.weekly?.resetsAt === 'number' &&
+          Number.isFinite(a.usage.weekly.resetsAt)
+            ? a.usage.weekly.resetsAt
+            : null,
+        buckets,
         usageUpdatedAt
       }
     })

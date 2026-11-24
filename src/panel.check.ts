@@ -50,24 +50,24 @@ const syncedSnapshot: SwitcherSnapshot = {
       isActive: true,
       isSelected: true,
       status: 'ok',
-      sessionUsedPercent: 7,
-      sessionResetsAt: now + 3 * 3600_000 + 2 * 60_000,
-      weeklyUsedPercent: 5,
-      weeklyResetsAt: now + (6 * 24 + 17) * 3600_000 + 2 * 60_000,
+      sessionUsedPercent: 48,
+      sessionResetsAt: now + 2 * 3600_000 + 35 * 60_000,
+      weeklyUsedPercent: 93,
+      weeklyResetsAt: now + (4 * 24 + 16) * 3600_000 + 14 * 60_000,
       buckets: [
         {
           group: 'Gemini Models',
-          sessionUsedPercent: 7,
-          sessionResetsAt: now + 3 * 3600_000 + 2 * 60_000,
-          weeklyUsedPercent: 5,
-          weeklyResetsAt: now + (6 * 24 + 17) * 3600_000 + 2 * 60_000
+          sessionUsedPercent: 48,
+          sessionResetsAt: now + 2 * 3600_000 + 35 * 60_000,
+          weeklyUsedPercent: 28,
+          weeklyResetsAt: now + (6 * 24 + 5) * 3600_000 + 10 * 60_000
         },
         {
           group: 'Claude and GPT models',
           sessionUsedPercent: 0,
           sessionResetsAt: now + 4 * 3600_000,
-          weeklyUsedPercent: 0,
-          weeklyResetsAt: now + 6 * 86400_000
+          weeklyUsedPercent: 93,
+          weeklyResetsAt: now + (4 * 24 + 16) * 3600_000 + 14 * 60_000
         }
       ],
       terminalCount: 2,

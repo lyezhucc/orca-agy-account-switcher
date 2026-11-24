@@ -1,4 +1,4 @@
-# 反重力多账号一键切换（Orca 插件 v0.2.7）
+# 反重力多账号一键切换（Orca 插件 v0.2.8）
 
 专为在 Orca 中同时使用多个 Google Antigravity (`agy`) 账号的用户打造的原生插件（插件 ID：`local.agy-account-switcher`）。
 
@@ -22,7 +22,7 @@ Orca 原生 Antigravity 对话存在两套底层引擎，本插件按 `ORCA_AGEN
   - **所有批量换号与一键同步按钮均先展开内联确认卡片**，精确显示目标账号额度与受影响终端数（立即原地重启几个空闲终端、几个干活中终端按策略如何处理），点击 `确认换号/确认同步` 后才真正执行。
 - **全维度额度与异时快照诚实可视化**：
   - `<Tabs>` 分栏收纳 `账号` 与 `终端`；
-  - 所有账号对称展示主池（`Gemini 5h` / `Gemini 周` 双进度条 + 精确到分钟的重置倒计时）与副池（`Claude/GPT 5h · 周`）；
+  - 所有账号严格按独立模型池展示主池（`Gemini 5h` / `Gemini 周` 双进度条 + 精确到分钟的重置倒计时）与副池（`Claude/GPT 5h · 周` 及活跃窗口重置倒计时），绝不因 Orca 顶层跨池汇总产生池间串值；
   - 非当前账号单独标注 `快照 · X小时前` 时效、主/副池已过重置窗口自动去红警标明 `已过重置（上轮 X% · 切入刷新）`；尚未切入读过额度的新号标为 `未读取` 且与历史报错号均可手动点选切入刷新，同时自动挑号保持“实测未过期 0% 优先于过期推算”；
   - 底部状态栏仅作纯只读展示（不可点击，防误触换号），悬停可查看当前反重力账号、5h/周额度与旧号/漂移提醒，所有操作收口在右侧「反重力换号」面板。
 - **跨工作区无损原地换号 + 自动回滚**：
@@ -57,7 +57,7 @@ orca plugin open github.lyezhucc.agy-account-switcher --panel switcher
 后续发布新版本后，一键升级：
 
 ```bash
-orca plugin update
+orca plugin update --all
 ```
 
 ### 方式二：从本地目录安装（离线/源码开发）
@@ -78,7 +78,7 @@ orca plugin open local.agy-account-switcher --panel switcher
 # 1. 类型检查（0 error）
 npx tsc --noEmit
 
-# 2. 校验 / 可打包性检查 / 单测（19 项）/ 3 场景静态检查
+# 2. 校验 / 可打包性检查 / 单测（22 项）/ 3 场景静态检查
 orca plugin validate . --json
 orca plugin inspect . --json
 orca plugin test . --json
