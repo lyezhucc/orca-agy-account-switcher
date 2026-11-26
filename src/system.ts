@@ -6,18 +6,22 @@
 // - H-3/L-2: 异步 fs/promises 读日志 + (size, mtimeMs) 缓存失效 + O(1) LRU + 尾优先防边界截断；
 // - H-4: 发 SIGTERM 前校验 pid>1 且复核 ucomm+lstart 防 PID 复用，僵尸态 Z 立即判退；
 // - H-8: `lsof -n -P` 防 DNS 反查超时，合并单次 `ps eww` 且跳过命令行前缀防伪造 env。
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { open as fsOpen, stat as fsStat } from 'node:fs/promises'
+import { open as fsOpen, readFile as fsReadFile, stat as fsStat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
 import {
   classifyAgyCommand,
+  extractApproveCommand,
   extractExplicitLogFile,
+  extractLatestTagVersion,
+  hasIsolatedChatGeminiDir,
   isAgyFamilyBinary,
   isManagedAcpBinary,
   isManagedAcpCommand,
+  parseSemver,
   shouldIgnoreUnstructuredAcpProbe
 } from './command-builder'
 import type { AccountBucketGroup, AgyProcessKind } from './protocol'
@@ -53,6 +57,8 @@ export interface RawAccountState {
   /** `orca account list` 探测到的宿主原生 Chat 是否走本机 `agy` 登录（超时竞速时可能缺省为 null）。 */
   chatUsesAgy?: boolean | null
   chatGoogleSignInInUse?: 'agy' | 'orca' | null
+  chatAgySignedOut?: boolean | null
+  chatKeyOnAgy?: boolean | null
 }
 
 export interface RawOrcaTerminal {
@@ -94,6 +100,23 @@ export interface RawAgyProcess {
   orcaSessionId?: string | null
   isStructuredSession?: boolean
   isManagedAcpServer?: boolean
+  hasDotGeminiHome?: boolean
+}
+
+export interface InstalledPluginMeta {
+  pluginKey: string
+  version: string
+  sourceKind: string
+  sourceRef: string | null
+  localManifestVersion: string | null
+}
+
+export interface PluginUpdateExecResult {
+  ok: boolean
+  needsApproval: boolean
+  newVersion: string | null
+  message: string
+  approvalCommand: string | null
 }
 
 export interface SystemAdapter {
@@ -116,6 +139,9 @@ export interface SystemAdapter {
   isProcessAlive(pid: number): boolean
   pathExists(p: string): boolean
   sleep(ms: number): Promise<void>
+  getSelfPluginMeta?(): Promise<InstalledPluginMeta | null>
+  fetchLatestRemoteVersion?(): Promise<string | null>
+  runPluginUpdate?(pluginKey: string): Promise<PluginUpdateExecResult>
 }
 
 const SHELL_BASENAMES = new Set(['zsh', 'bash', 'fish', 'sh'])
@@ -142,6 +168,69 @@ function resolveOrcaBin(): string {
 
 const PS_BIN = resolveBinary(['/bin/ps', '/usr/bin/ps'], 'ps')
 const LSOF_BIN = resolveBinary(['/usr/sbin/lsof', '/usr/bin/lsof'], 'lsof')
+const GIT_BIN = resolveBinary(
+  ['/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git'],
+  'git'
+)
+const PLUGIN_REMOTE_REPO_URL = 'https://github.com/lyezhucc/orca-agy-account-switcher.git'
+
+/**
+ * 使用独立进程组（`detached: true`）执行自更新命令：
+ * 当 Orca 主进程热替换当前旧 Worker 并向旧 Worker 发送 SIGTERM 时，
+ * 独立进程组可确保 `orca plugin update` CLI 进程不被连带误杀。
+ */
+async function runDetachedCmd(
+  file: string,
+  args: string[],
+  timeoutMs = 60000
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  return new Promise((resolve) => {
+    let settled = false
+    let stdout = ''
+    let stderr = ''
+    const finish = (code: number) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ stdout, stderr, code })
+    }
+    const timer = setTimeout(() => {
+      finish(124)
+    }, timeoutMs)
+    const t = timer as unknown as { unref?: () => void }
+    t.unref?.()
+
+    try {
+      const child = spawn(file, args, {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: '0',
+          GCM_INTERACTIVE: 'never',
+          PATH: `${process.env.PATH ?? ''}:/Applications/Orca.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`
+        }
+      })
+      child.stdout?.on('data', (chunk) => {
+        if (stdout.length < 2 * 1024 * 1024) stdout += String(chunk)
+      })
+      child.stderr?.on('data', (chunk) => {
+        if (stderr.length < 2 * 1024 * 1024) stderr += String(chunk)
+      })
+      child.on('error', (err) => {
+        stderr += err.message
+        finish(1)
+      })
+      child.on('close', (code) => {
+        finish(typeof code === 'number' ? code : 1)
+      })
+      child.unref()
+    } catch (err: unknown) {
+      stderr += err instanceof Error ? err.message : String(err)
+      finish(1)
+    }
+  })
+}
 
 async function runCmd(
   file: string,
@@ -433,14 +522,14 @@ export function parseAccountBuckets(
       if (typeof b.usedPercent === 'number' && Number.isFinite(b.usedPercent)) {
         item.weeklyUsedPercent = b.usedPercent
       }
-      if (typeof b.resetsAt === 'number' && Number.isFinite(b.resetsAt)) {
+      if (typeof b.resetsAt === 'number' && Number.isFinite(b.resetsAt) && b.resetsAt > 0) {
         item.weeklyResetsAt = b.resetsAt
       }
     } else if (isFiveHour) {
       if (typeof b.usedPercent === 'number' && Number.isFinite(b.usedPercent)) {
         item.sessionUsedPercent = b.usedPercent
       }
-      if (typeof b.resetsAt === 'number' && Number.isFinite(b.resetsAt)) {
+      if (typeof b.resetsAt === 'number' && Number.isFinite(b.resetsAt) && b.resetsAt > 0) {
         item.sessionResetsAt = b.resetsAt
       }
     }
@@ -489,6 +578,8 @@ export class RealSystemAdapter implements SystemAdapter {
           currentAccount?: { email?: string | null } | null
           chatUsesAgy?: boolean | null
           chatGoogleSignInInUse?: string | null
+          chatAgySignedOut?: boolean | null
+          chatKeyOnAgy?: boolean | null
           accounts?: Array<{
             id: string
             email: string
@@ -538,7 +629,8 @@ export class RealSystemAdapter implements SystemAdapter {
             : null,
         sessionResetsAt:
           typeof a.usage?.session?.resetsAt === 'number' &&
-          Number.isFinite(a.usage.session.resetsAt)
+          Number.isFinite(a.usage.session.resetsAt) &&
+          a.usage.session.resetsAt > 0
             ? a.usage.session.resetsAt
             : null,
         weeklyUsedPercent:
@@ -548,7 +640,8 @@ export class RealSystemAdapter implements SystemAdapter {
             : null,
         weeklyResetsAt:
           typeof a.usage?.weekly?.resetsAt === 'number' &&
-          Number.isFinite(a.usage.weekly.resetsAt)
+          Number.isFinite(a.usage.weekly.resetsAt) &&
+          a.usage.weekly.resetsAt > 0
             ? a.usage.weekly.resetsAt
             : null,
         buckets,
@@ -564,7 +657,9 @@ export class RealSystemAdapter implements SystemAdapter {
       chatGoogleSignInInUse:
         ag.chatGoogleSignInInUse === 'agy' || ag.chatGoogleSignInInUse === 'orca'
           ? ag.chatGoogleSignInInUse
-          : null
+          : null,
+      chatAgySignedOut: typeof ag.chatAgySignedOut === 'boolean' ? ag.chatAgySignedOut : null,
+      chatKeyOnAgy: typeof ag.chatKeyOnAgy === 'boolean' ? ag.chatKeyOnAgy : null
     }
   }
 
@@ -841,8 +936,15 @@ export class RealSystemAdapter implements SystemAdapter {
       activeRows.map(async (row): Promise<RawAgyProcess> => {
         const fdInfo = lsofMap.get(row.pid)
         const envInfo = envMap.get(row.pid)
-        const isManagedAcpServer =
-          row.isManagedBinary || Boolean(envInfo?.geminiHome?.includes('antigravity-chat'))
+        const geminiHome = envInfo?.geminiHome ?? ''
+        const normalizedGeminiHome = geminiHome.trim().replace(/[\\/]+$/, '')
+        const hasDotGeminiHome =
+          normalizedGeminiHome.length > 0 && basename(normalizedGeminiHome) === '.gemini'
+        const isIsolatedChatHome =
+          geminiHome.includes('antigravity-chat') ||
+          geminiHome.includes('antigravity-agy-chat') ||
+          hasIsolatedChatGeminiDir(row.command)
+        const isManagedAcpServer = row.isManagedBinary || isIsolatedChatHome
         const logPath =
           !isManagedAcpServer ? fdInfo?.logPath ?? explicitLogFiles.get(row.pid) ?? null : null
         const authEmail = logPath ? await this.getCachedLogEmail(logPath) : null
@@ -868,7 +970,8 @@ export class RealSystemAdapter implements SystemAdapter {
           authEmail,
           orcaSessionId: envInfo?.orcaSessionId ?? null,
           isStructuredSession: Boolean(envInfo?.isStructuredSession),
-          isManagedAcpServer
+          isManagedAcpServer,
+          hasDotGeminiHome
         }
       })
     )
@@ -1020,6 +1123,159 @@ export class RealSystemAdapter implements SystemAdapter {
 
   sleep(ms: number): Promise<void> {
     return sleepImpl(ms)
+  }
+
+  async getSelfPluginMeta(): Promise<InstalledPluginMeta | null> {
+    const res = await runCmd(this.orcaBin, ['plugin', 'list', '--json'], 12000)
+    if (res.code !== 0) return null
+    const parsed = safeParseJson<{
+      ok?: boolean
+      result?: {
+        plugins?: Array<{
+          pluginKey?: string
+          version?: string
+          status?: string
+          isDev?: boolean
+          source?: { kind?: string; reference?: string | null } | null
+        }>
+      }
+    }>(res.stdout)
+    if (!parsed.ok || parsed.data.ok === false) return null
+
+    const list = (parsed.data.result?.plugins ?? []).filter(
+      (p) =>
+        typeof p.pluginKey === 'string' &&
+        (p.pluginKey === 'github.lyezhucc.agy-account-switcher' ||
+          p.pluginKey.endsWith('.agy-account-switcher'))
+    )
+    if (list.length === 0) return null
+
+    // 优先匹配正式运行中的非 dev 实例（如存在 GitHub 安装与本地安装并存，优先 running 实例）
+    const chosen =
+      list.find((p) => !p.isDev && p.status === 'running') ??
+      list.find((p) => !p.isDev) ??
+      list[0]!
+
+    const pluginKey = chosen.pluginKey!
+    const version = chosen.version?.trim() || '0.0.0'
+    const sourceKind = chosen.source?.kind?.trim() || 'unknown'
+    const sourceRef = chosen.source?.reference?.trim() || null
+
+    let localManifestVersion: string | null = null
+    if (sourceKind === 'local-path' && sourceRef) {
+      try {
+        const rawManifest = await fsReadFile(join(sourceRef, 'orca-plugin.json'), 'utf8')
+        const manifestJson = safeParseJson<{ version?: string }>(rawManifest)
+        if (manifestJson.ok && manifestJson.data.version && parseSemver(manifestJson.data.version)) {
+          localManifestVersion = manifestJson.data.version.trim().replace(/^v/, '')
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    return {
+      pluginKey,
+      version,
+      sourceKind,
+      sourceRef,
+      localManifestVersion
+    }
+  }
+
+  async fetchLatestRemoteVersion(): Promise<string | null> {
+    const res = await runCmd(
+      GIT_BIN,
+      ['ls-remote', '--tags', '--refs', PLUGIN_REMOTE_REPO_URL],
+      10000,
+      {
+        GIT_TERMINAL_PROMPT: '0',
+        GCM_INTERACTIVE: 'never'
+      }
+    )
+    if (res.code !== 0 || !res.stdout.trim()) return null
+    return extractLatestTagVersion(res.stdout)
+  }
+
+  async runPluginUpdate(pluginKey: string): Promise<PluginUpdateExecResult> {
+    const res = await runDetachedCmd(
+      this.orcaBin,
+      ['plugin', 'update', pluginKey, '--json'],
+      60000
+    )
+    const parsed = safeParseJson<{
+      ok?: boolean
+      result?: {
+        version?: string
+        plugin?: { version?: string }
+      }
+      error?: {
+        code?: string
+        message?: string
+        data?: {
+          consentFingerprint?: string
+          approveCommand?: string
+          nextSteps?: string[]
+        }
+      }
+    }>(res.stdout)
+
+    if (res.code === 0 && (!parsed.ok || parsed.data.ok !== false)) {
+      const newVer = parsed.ok
+        ? parsed.data.result?.version ?? parsed.data.result?.plugin?.version ?? null
+        : null
+      return {
+        ok: true,
+        needsApproval: false,
+        newVersion: newVer,
+        message: newVer ? `已更新到最新版本 v${newVer}` : '插件更新已完成',
+        approvalCommand: null
+      }
+    }
+
+    const errCode = parsed.ok ? parsed.data.error?.code ?? '' : ''
+    const errMsg = parsed.ok
+      ? parsed.data.error?.message || ''
+      : res.stderr.trim() || res.stdout.trim()
+    const nextStepsText =
+      parsed.ok && Array.isArray(parsed.data.error?.data?.nextSteps)
+        ? parsed.data.error!.data!.nextSteps!.join('\n')
+        : ''
+    const combinedRaw = [
+      parsed.ok ? parsed.data.error?.data?.approveCommand ?? '' : '',
+      nextStepsText,
+      errMsg,
+      res.stderr,
+      res.stdout
+    ].join('\n')
+
+    const isApproval =
+      res.code === 3 ||
+      errCode === 'approval_required' ||
+      errCode === 'approval_stale' ||
+      combinedRaw.includes('--approve')
+
+    if (isApproval) {
+      const fp = parsed.ok ? parsed.data.error?.data?.consentFingerprint ?? null : null
+      const approveCmd =
+        extractApproveCommand(combinedRaw, pluginKey, fp) ??
+        `orca plugin update ${pluginKey}`
+      return {
+        ok: false,
+        needsApproval: true,
+        newVersion: null,
+        message: '此版本申请了新权限，请在终端运行确认命令完成升级',
+        approvalCommand: approveCmd
+      }
+    }
+
+    return {
+      ok: false,
+      needsApproval: false,
+      newVersion: null,
+      message: errMsg || `更新失败（退出码 ${res.code}）`,
+      approvalCommand: null
+    }
   }
 }
 

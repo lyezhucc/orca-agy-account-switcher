@@ -10,6 +10,8 @@ export type ChatEngine = 'host-agy' | 'orca-managed'
 
 export type ChatBackendMode = 'host-agy' | 'orca-managed' | 'unknown'
 
+export type ChatIsolationReason = 'orca-signin' | 'agy-signed-out' | 'api-key' | 'managed-only'
+
 export interface AccountBucketGroup {
   group: string
   sessionUsedPercent: number | null
@@ -57,6 +59,8 @@ export interface AgyTerminalInfo {
   orcaSessionId?: string | null
   /** 原生 Chat 所运行的底层引擎：宿主 `agy`（共享系统号）或 Orca 托管独立账号池。 */
   chatEngine?: ChatEngine | null
+  /** 进程显式携带末段为 `.gemini` 的 `GEMINI_HOME`（受 Orca `releaseIdleSession` / `owesWork` 管辖）。 */
+  hasDotGeminiHome?: boolean
 }
 
 export interface DriftWarning {
@@ -70,6 +74,24 @@ export interface RecoveryCommandItem {
   label: string
   command: string
   reason: string
+}
+
+export interface PluginUpdateInfo {
+  currentVersion: string
+  latestVersion: string
+  pluginKey: string
+  sourceKind: string
+  /** 是否可直接点击按钮一键升级（GitHub/Catalog 安装，或本地源码目录已拉取新版本）。 */
+  canOneClickUpdate: boolean
+  /** 若新版本增加了权限需要用户确认，展示此完整授权命令。 */
+  approvalCommand?: string | null
+}
+
+export interface ApplyUpdateOutput {
+  status: 'updated' | 'approval_required' | 'failed'
+  newVersion?: string | null
+  message: string
+  approvalCommand?: string | null
 }
 
 export interface OperationSummary {
@@ -102,12 +124,15 @@ export interface SwitcherSnapshot {
   queuedCount: number
   workingPolicy: WorkingPolicy
   chatBackendMode?: ChatBackendMode
+  chatIsolationReason?: ChatIsolationReason | null
   drift: DriftWarning | null
   busy: boolean
   busyLabel: string | null
   scanDegradedReason: string | null
   lastOperation: OperationSummary | null
   error: string | null
+  pluginVersion?: string
+  updateInfo?: PluginUpdateInfo | null
   isPreview?: boolean
 }
 
@@ -132,7 +157,8 @@ export interface SyncToCurrentInput {
 }
 
 export interface RestartOneInput {
-  terminalId: string
+  terminalId?: string
+  sessionKey?: string
   targetAccountId?: string
   force?: boolean
 }
@@ -143,7 +169,8 @@ export interface KillExternalInput {
 }
 
 export interface FocusTerminalInput {
-  terminalId: string
+  terminalId?: string
+  worktreeId?: string
 }
 
 export interface SetPolicyInput {
@@ -191,6 +218,9 @@ declare module 'orca' {
     'switcher.setPolicy': {
       input: SetPolicyInput
       output: SwitcherSnapshot
+    }
+    'switcher.applyUpdate': {
+      output: ApplyUpdateOutput
     }
   }
 

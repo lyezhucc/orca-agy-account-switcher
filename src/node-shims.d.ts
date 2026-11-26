@@ -36,6 +36,7 @@ declare module 'node:fs/promises' {
   }
   export function open(p: string, flags: string): Promise<FileHandle>
   export function stat(p: string): Promise<{ size: number; mtimeMs: number }>
+  export function readFile(p: string, encoding: 'utf8'): Promise<string>
 }
 
 declare module 'node:child_process' {
@@ -45,12 +46,33 @@ declare module 'node:child_process' {
     env?: Record<string, string | undefined>
     signal?: AbortSignal
   }
+  export interface SpawnOptions {
+    detached?: boolean
+    stdio?: Array<'ignore' | 'pipe'>
+    env?: Record<string, string | undefined>
+  }
+  export interface ChildStream {
+    on(event: 'data', listener: (chunk: Buffer | string) => void): this
+  }
+  export interface ChildProcessLike {
+    readonly pid?: number
+    readonly stdout: ChildStream | null
+    readonly stderr: ChildStream | null
+    on(event: 'close', listener: (code: number | null) => void): this
+    on(event: 'error', listener: (err: Error) => void): this
+    unref(): void
+  }
   export function execFile(
     file: string,
     args: readonly string[],
     options: ExecFileOptions,
     callback: (error: Error | null, stdout: string, stderr: string) => void
   ): void
+  export function spawn(
+    command: string,
+    args: readonly string[],
+    options?: SpawnOptions
+  ): ChildProcessLike
 }
 
 declare module 'node:util' {

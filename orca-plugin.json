@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "agy-account-switcher",
   "name": "反重力多账号一键切换",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "实时查看所有 Antigravity 账号额度，一键切换账号并将跨工作区运行中的 agy 终端原地无损换号续接对话；精确观测并区分宿主/托管原生 Chat 对话状态与后台回跳风险。",
   "engines": {
     "orca": ">=1.4.259"

@@ -62,10 +62,13 @@ export function createWorker(
       return service.cancelQueue()
     }),
     orca.panels.handle('switcher.focusTerminal', async (input) => {
-      return service.focusTerminal(input.terminalId)
+      return service.focusTerminal(input)
     }),
     orca.panels.handle('switcher.setPolicy', async (input) => {
       return service.setWorkingPolicy(input.workingPolicy)
+    }),
+    orca.panels.handle('switcher.applyUpdate', async () => {
+      return service.applyPluginUpdate()
     }),
     orca.commands.register('agy-switcher.quickSync', async () => {
       return service.quickSyncCommand()
@@ -90,6 +93,8 @@ export function createWorker(
     orca.events.on('agent.status.changed', async (event) => {
       await service.handleAgentStatusChanged({
         terminalId: event.terminalId,
+        sessionId: event.sessionId,
+        paneKey: event.paneKey,
         state: event.state
       })
     }),
@@ -144,6 +149,7 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
           orca.log(`poll refreshSnapshot failed: ${err instanceof Error ? err.message : String(err)}`)
         )
         .finally(() => {
+          service.maybeCheckUpdateInBackground()
           void scheduleNextTick(expectedGen).catch((err) =>
             orca.log(`scheduleNextTick failed: ${err instanceof Error ? err.message : String(err)}`)
           )
@@ -181,6 +187,7 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     .finally(() => {
       // 若激活期间已被 deactivate，绝不启动僵尸轮询
       if (gen === pollGeneration && !service.isDisposed()) {
+        service.scheduleInitialUpdateCheck(3000)
         void scheduleNextTick(gen).catch((err) =>
           orca.log(`initial scheduleNextTick failed: ${err instanceof Error ? err.message : String(err)}`)
         )

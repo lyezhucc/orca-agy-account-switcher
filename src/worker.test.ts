@@ -5,14 +5,21 @@ import {
   buildRestartCommand,
   classifyAgyCommand,
   compareAccountsByHeadroom,
+  compareSemver,
   computeStatusBar,
   computeSwitchImpact,
+  extractApproveCommand,
+  extractLatestTagVersion,
+  extractSessionIdFromPaneKey,
   formatResetCountdown,
   formatSnapshotAge,
+  getSessionQueueKey,
+  hasIsolatedChatGeminiDir,
   isAgyFamilyBinary,
   isManagedAcpBinary,
   isManagedAcpCommand,
   isQuotaWindowExpired,
+  parseSemver,
   pickBestAccount,
   resolveAccountQuotaPools,
   resolvePrimaryQuota,
@@ -25,6 +32,8 @@ import {
   parseAccountBuckets,
   parseLsofOutput,
   parsePsEnvOutput,
+  type InstalledPluginMeta,
+  type PluginUpdateExecResult,
   type QueryResult,
   type RawAccountState,
   type RawAgyProcess,
@@ -49,6 +58,10 @@ class FakeSystemAdapter implements SystemAdapter {
   processes: RawAgyProcess[]
   alivePids = new Set<number>()
   existingPaths = new Set<string>(['/work/valid-dir'])
+  getSelfPluginMeta?: () => Promise<InstalledPluginMeta | null>
+  fetchLatestRemoteVersion?: () => Promise<string | null>
+  runPluginUpdate?: (pluginKey: string) => Promise<PluginUpdateExecResult>
+  onListOrcaAgents?: () => void
 
   constructor(init: {
     accountState: RawAccountState
@@ -90,6 +103,7 @@ class FakeSystemAdapter implements SystemAdapter {
   }
 
   async listOrcaAgents(): Promise<QueryResult<RawOrcaAgent>> {
+    this.onListOrcaAgents?.()
     if (!this.agentsQueryOk) {
       return { ok: false, items: [], degradedReason: '模拟 agent list 超时' }
     }
@@ -341,12 +355,14 @@ test('[H-5] pickBestAccount 拒绝返回全部异常的坏账号', () => {
   assert.equal(pickBestAccount(broken), null)
 })
 
-test('[UI精细度] formatResetCountdown、isQuotaWindowExpired 与 formatSnapshotAge 精确到分钟并正确处理已过期窗口', () => {
+test('[UI精细度] formatResetCountdown、isQuotaWindowExpired 与 formatSnapshotAge 精确到分钟并正确处理已重置与未开窗(0)', () => {
   const base = new Date(2026, 10, 22, 22, 30, 0).getTime()
   assert.equal(isQuotaWindowExpired(base - 60_000, base), true)
   assert.equal(isQuotaWindowExpired(base, base), true)
   assert.equal(isQuotaWindowExpired(base + 1, base), false)
   assert.equal(isQuotaWindowExpired(null, base), false)
+  assert.equal(isQuotaWindowExpired(0, base), false)
+  assert.equal(isQuotaWindowExpired(-100, base), false)
 
   assert.equal(formatSnapshotAge(base - 20_000, base), '刚刚')
   assert.equal(formatSnapshotAge(base - 15 * 60_000, base), '15分钟前')
@@ -354,14 +370,15 @@ test('[UI精细度] formatResetCountdown、isQuotaWindowExpired 与 formatSnapsh
   assert.equal(formatSnapshotAge(base - 3 * 86400_000, base), '3天前')
   assert.equal(formatSnapshotAge(null, base), null)
 
-  assert.equal(formatResetCountdown(base - 60_000, base), '窗口已过 · 切入刷新')
+  assert.equal(formatResetCountdown(0, base), '—')
+  assert.equal(formatResetCountdown(base - 60_000, base), '切换后更新')
   assert.equal(
     formatResetCountdown(base - 60_000, base, 'short', { isActive: true }),
-    '窗口已过 · 点刷新'
+    '待刷新'
   )
   assert.equal(
     formatResetCountdown(base - 60_000, base, 'full', { isActive: true }),
-    '窗口已过，待刷新'
+    '已重置，待刷新'
   )
   assert.equal(formatResetCountdown(base + 42 * 60_000, base), '42分钟 · 23:12')
   assert.equal(
@@ -994,25 +1011,34 @@ test('[路线A] 同工作区多原生 Chat 1-on-1 精准绑定、探活鬼影去
   assert.equal(idleChat.agentState, 'done')
   assert.equal(idleChat.isOutdated, false)
 
-  // 托管引擎完全隔离：authEmail 置空、不算旧号、不算未识别邮箱
+  // 托管引擎完全隔离：authEmail 置空、不算旧号、不算未识别邮箱、不可切换
   assert.equal(managedChat.title, '托管独立对话')
   assert.equal(managedChat.chatEngine, 'orca-managed')
   assert.equal(managedChat.authEmail, null)
   assert.equal(managedChat.isOutdated, false)
+  assert.equal(managedChat.canRestartInPlace, false)
+  assert.equal(idleChat.canRestartInPlace, true)
+  assert.equal(busyChat.canRestartInPlace, true)
 
-  // 执行批量换号：严格按路线 A，绝不强杀任何 Chat 进程！
-  await worker.request('switcher.switchAll', {
-    targetAccountId: 'acc-1',
-    workingPolicy: 'force',
-    onlyOutdated: true
-  })
-  assert.equal(sys.events.some((e) => e.startsWith('stop:')), false)
-
-  // computeSwitchImpact 同步验证受影响数量与托管提示
+  // computeSwitchImpact 同步验证：宿主共号 busyChat 纳入排队（queuedChatCount=1），托管独立引擎完全隔离
   const impact = computeSwitchImpact(snap, 'fresh@gmail.com', 'queue')
-  assert.equal(impact.acpCount, 1)
+  assert.equal(impact.queueCount, 1)
+  assert.equal(impact.queuedChatCount, 1)
+  assert.equal(impact.acpCount, 0)
   assert.equal(impact.managedChatCount, 1)
   assert.equal(impact.unknownAuthCount, 0)
+
+  // 执行批量换号到 acc-1 (old@gmail.com)：
+  // - 空闲宿主 Chat (8002, fresh@gmail.com) 被优雅释放以便下次说话走新号；
+  // - 已是目标号的 busyChat (8001) 与托管独立引擎 (8003) 绝不被误停！
+  await worker.request('switcher.switchAll', {
+    targetAccountId: 'acc-1',
+    workingPolicy: 'queue',
+    onlyOutdated: true
+  })
+  assert.equal(sys.events.includes('stop:8002'), true)
+  assert.equal(sys.events.includes('stop:8001'), false)
+  assert.equal(sys.events.includes('stop:8003'), false)
 
   // statusBar.update 上限护栏：极端多旧号+长工作区名+长邮箱下，text<=64 且 tooltip<=256
   const stressSnap = {
@@ -1180,7 +1206,7 @@ test('[v0.2.6] computeStatusBar 在当前号 5h 窗口已过重置时不触发 1
   assert.equal(sb.tone, 'neutral')
   assert.ok(sb.text.includes('待刷新'))
   assert.equal(sb.text.includes('100%'), false)
-  assert.ok(sb.tooltip.includes('5h 已过重置·上轮100%（待刷新）'))
+  assert.ok(sb.tooltip.includes('5h 已重置（待刷新）'))
   assert.ok(sb.text.length <= 64)
   assert.ok(sb.tooltip.length <= 256)
 })
@@ -1469,7 +1495,7 @@ test('[v0.2.8] parseAccountBuckets 与分池解析严格隔离 Gemini 主池与 
   assert.ok(sb.text.length <= 64)
   assert.ok(sb.tooltip.length <= 256)
 
-  // 6) parseAccountBuckets 结构化 windowMinutes/windowName 优先，不被 name 中的字样误判窗口
+  // 6) parseAccountBuckets 结构化 windowMinutes/windowName 优先，且 resetsAt=0 归一为 null
   const structPriority = parseAccountBuckets([
     {
       name: 'Model-Week-Edition · 5h',
@@ -1478,11 +1504,31 @@ test('[v0.2.8] parseAccountBuckets 与分池解析严格隔离 Gemini 主池与 
       windowMinutes: 300,
       usedPercent: 33,
       resetsAt: gem5hReset
+    },
+    {
+      name: 'Claude and GPT models · Five Hour',
+      group: 'Claude and GPT models',
+      windowName: 'Five Hour Limit Remaining',
+      windowMinutes: 300,
+      usedPercent: 0,
+      resetsAt: 0
+    },
+    {
+      name: 'Claude and GPT models · Weekly',
+      group: 'Claude and GPT models',
+      windowName: 'Weekly Limit Remaining',
+      windowMinutes: 10080,
+      usedPercent: 0,
+      resetsAt: 0
     }
   ])
-  assert.equal(structPriority.length, 1)
+  assert.equal(structPriority.length, 2)
   assert.equal(structPriority[0]!.sessionUsedPercent, 33)
   assert.equal(structPriority[0]!.weeklyUsedPercent, null)
+  assert.equal(structPriority[1]!.sessionUsedPercent, 0)
+  assert.equal(structPriority[1]!.sessionResetsAt, null)
+  assert.equal(structPriority[1]!.weeklyUsedPercent, 0)
+  assert.equal(structPriority[1]!.weeklyResetsAt, null)
 
   // 7) 无 buckets 的老账号安全回退顶层字段，不贴错误池名
   const legacyPrimary = resolvePrimaryQuota({
@@ -1578,6 +1624,660 @@ test('[v0.2.8] quickSyncCommand 仅在主池 5h 满额时自动换号，不被�
   const msg = await service.quickSyncCommand()
   assert.equal(sys.events.length, 0)
   assert.ok(msg.includes('全部已同步'))
+
+  service.dispose()
+  await worker.deactivate()
+})
+
+test('[v0.2.9] 新版本检测、单次通知去重、一键更新与新权限确认命令兜底', async () => {
+  // 1) 纯函数：语义化版本比较与 git ls-remote tag 解析（跳过预发布版）
+  assert.deepEqual(parseSemver('v0.2.10'), [0, 2, 10])
+  assert.equal(parseSemver('v0.3.0-beta.1'), null)
+  assert.ok(compareSemver('0.2.10', '0.2.9') > 0)
+  assert.ok(compareSemver('0.3.0', '0.2.10') > 0)
+  assert.equal(compareSemver('0.2.9', '0.2.9'), 0)
+
+  const tagsRaw = [
+    '781ceb8249b8782558aa7f047eb5bc5440d513f8\trefs/tags/v0.2.7',
+    '5d0753074259ad2002e5d63ad80149ccfda004a5\trefs/tags/v0.2.9',
+    'aaaaeb8249b8782558aa7f047eb5bc5440d513f8\trefs/tags/v0.2.10',
+    'bbbbeb8249b8782558aa7f047eb5bc5440d513f8\trefs/tags/v0.4.0-rc.1'
+  ].join('\n')
+  assert.equal(extractLatestTagVersion(tagsRaw), '0.2.10')
+
+  assert.equal(
+    extractApproveCommand(
+      'Approval needed',
+      'github.lyezhucc.agy-account-switcher',
+      'sha256-abc123='
+    ),
+    'orca plugin update github.lyezhucc.agy-account-switcher --approve sha256-abc123='
+  )
+
+  // 2) 服务层：GitHub 安装用户发现新版本 -> 桌面通知仅弹 1 次 -> 审批兜底 -> 正常一键升级
+  const sys = makeFixture()
+  let installedMeta: InstalledPluginMeta = {
+    pluginKey: 'github.lyezhucc.agy-account-switcher',
+    version: '0.2.9',
+    sourceKind: 'git',
+    sourceRef: 'lyezhucc/orca-agy-account-switcher',
+    localManifestVersion: null
+  }
+  let remoteLatest = '0.3.0'
+  let updateResult: PluginUpdateExecResult = {
+    ok: false,
+    needsApproval: true,
+    newVersion: null,
+    message: '此版本申请了新权限',
+    approvalCommand:
+      'orca plugin update github.lyezhucc.agy-account-switcher --approve sha256-newfp='
+  }
+  sys.getSelfPluginMeta = async () => installedMeta
+  sys.fetchLatestRemoteVersion = async () => remoteLatest
+  sys.runPluginUpdate = async (pluginKey: string) => {
+    sys.events.push(`pluginUpdate:${pluginKey}`)
+    return updateResult
+  }
+
+  let notifyCount = 0
+  const host = mockHost({
+    settings: { workingPolicy: 'queue', notifyOnComplete: false },
+    results: {
+      'statusBar.update': { ok: true },
+      'notifications.show': () => {
+        notifyCount += 1
+        return { ok: true }
+      }
+    }
+  })
+
+  let service!: SwitcherService
+  const worker = await mountWorker(
+    {
+      default(orca: OrcaWorkerApi) {
+        service = createWorker(orca, sys)
+      }
+    },
+    { host }
+  )
+
+  await service.refreshSnapshot({ refreshAccounts: false })
+  await service.checkForPluginUpdate({ force: true })
+  let snap = await service.getSnapshot()
+  assert.equal(snap.pluginVersion, '0.2.9')
+  assert.equal(snap.updateInfo?.latestVersion, '0.3.0')
+  assert.equal(snap.updateInfo?.canOneClickUpdate, true)
+  assert.equal(notifyCount, 1)
+
+  // 再次检查同一版本不重复弹桌面通知
+  await service.checkForPluginUpdate({ force: true })
+  assert.equal(notifyCount, 1)
+
+  // 首次点击更新模拟需要确认新权限 -> 返回 approval_required 且快照保留 approvalCommand
+  const resApproval = await service.applyPluginUpdate()
+  assert.equal(resApproval.status, 'approval_required')
+  snap = await service.getSnapshot()
+  assert.equal(
+    snap.updateInfo?.approvalCommand,
+    'orca plugin update github.lyezhucc.agy-account-switcher --approve sha256-newfp='
+  )
+
+  // 随后模拟免审批直接升级成功 -> 清空 updateInfo 且版本号升至 0.3.0
+  updateResult = {
+    ok: true,
+    needsApproval: false,
+    newVersion: '0.3.0',
+    message: '已更新到最新版本 v0.3.0',
+    approvalCommand: null
+  }
+  installedMeta = { ...installedMeta, version: '0.3.0' }
+  const resOk = await service.applyPluginUpdate()
+  assert.equal(resOk.status, 'updated')
+  snap = await service.getSnapshot()
+  assert.equal(snap.pluginVersion, '0.3.0')
+  assert.equal(snap.updateInfo, null)
+
+  service.dispose()
+  await worker.deactivate()
+})
+
+test('[v0.2.9-chat] 纯对话框场景：空闲对话自动换号、回复中对话排队后凭 paneKey 事件自动补切、防回跳锁回与独立通道诊断', async () => {
+  assert.equal(
+    extractSessionIdFromPaneKey(
+      'structured-agent-session-c2992ce6-2549-41e8-a03b-e7c921cd40c7:305c4bce-d463'
+    ),
+    'c2992ce6-2549-41e8-a03b-e7c921cd40c7'
+  )
+  assert.equal(extractSessionIdFromPaneKey('tab1:leaf1'), null)
+  assert.equal(
+    getSessionQueueKey({
+      processKind: 'acp',
+      orcaSessionId: 'sess-123',
+      pid: 9001,
+      chatEngine: 'host-agy'
+    }),
+    'acp:sess-123'
+  )
+  assert.equal(
+    getSessionQueueKey({
+      processKind: 'acp',
+      orcaSessionId: 'sess-managed',
+      pid: 9002,
+      chatEngine: 'orca-managed'
+    }),
+    null
+  )
+
+  const future5h = Date.now() + 3 * 3600_000
+  const futureWeek = Date.now() + 5 * 86400_000
+  const sys = new FakeSystemAdapter({
+    accountState: {
+      activeAccountId: 'acc-1',
+      selectedAccountId: 'acc-1',
+      currentEmail: 'old@example.com',
+      chatUsesAgy: true,
+      chatGoogleSignInInUse: 'agy',
+      accounts: [
+        {
+          id: 'acc-1',
+          email: 'old@example.com',
+          label: null,
+          status: 'ok',
+          sessionUsedPercent: 100,
+          sessionResetsAt: future5h,
+          weeklyUsedPercent: 80,
+          weeklyResetsAt: futureWeek,
+          buckets: []
+        },
+        {
+          id: 'acc-2',
+          email: 'fresh@example.com',
+          label: null,
+          status: 'ok',
+          sessionUsedPercent: 0,
+          sessionResetsAt: future5h,
+          weeklyUsedPercent: 5,
+          weeklyResetsAt: futureWeek,
+          buckets: []
+        }
+      ]
+    },
+    terminals: [],
+    agents: [
+      {
+        orcaSessionId: 'chat-idle-1',
+        kind: 'chat',
+        terminalId: null,
+        paneKey: 'structured-agent-session-chat-idle-1:leaf-a',
+        worktreeId: 'folder:ws-1',
+        workspace: '日常写作',
+        repo: null,
+        agent: 'antigravity',
+        state: 'done',
+        title: '润色文章'
+      },
+      {
+        orcaSessionId: 'chat-busy-2',
+        kind: 'chat',
+        terminalId: null,
+        paneKey: 'structured-agent-session-chat-busy-2:leaf-b',
+        worktreeId: 'folder:ws-2',
+        workspace: '选题调研',
+        repo: null,
+        agent: 'antigravity',
+        state: 'working',
+        title: '搜索竞品笔记'
+      }
+    ],
+    processes: [
+      {
+        pid: 7101,
+        ppid: 1,
+        processKind: 'acp',
+        parentIsShell: false,
+        hasAgyAncestor: false,
+        startedAtText: 'Thu Nov 26 15:00:00 2026',
+        command: 'agy acp --dangerously-skip-permissions',
+        terminalHandle: null,
+        worktreeId: 'folder:ws-1',
+        conversationId: null,
+        authEmail: 'old@example.com',
+        orcaSessionId: 'chat-idle-1',
+        isStructuredSession: true,
+        isManagedAcpServer: false
+      },
+      {
+        pid: 7102,
+        ppid: 1,
+        processKind: 'acp',
+        parentIsShell: false,
+        hasAgyAncestor: false,
+        startedAtText: 'Thu Nov 26 15:05:00 2026',
+        command: 'agy acp --dangerously-skip-permissions',
+        terminalHandle: null,
+        worktreeId: 'folder:ws-2',
+        conversationId: null,
+        authEmail: 'old@example.com',
+        orcaSessionId: 'chat-busy-2',
+        isStructuredSession: true,
+        isManagedAcpServer: false
+      }
+    ]
+  })
+
+  let openedWorkspaceId: string | null = null
+  const host = mockHost({
+    settings: { workingPolicy: 'queue', notifyOnComplete: false, autoGuardDrift: true },
+    results: {
+      'statusBar.update': { ok: true },
+      'notifications.show': { delivered: true },
+      'workspace.open': (params: { workspaceId: string }) => {
+        openedWorkspaceId = params.workspaceId
+        return { opened: true }
+      }
+    }
+  })
+
+  let service!: SwitcherService
+  const worker = await mountWorker(
+    {
+      default(orca: OrcaWorkerApi) {
+        service = createWorker(orca, sys)
+      }
+    },
+    { host }
+  )
+
+  // 1) 定位对话框：无 terminalId 时自动调用 workspace.open 打开所在工作区
+  const focusRes = await worker.request('switcher.focusTerminal', { worktreeId: 'folder:ws-2' })
+  assert.equal(focusRes.focused, true)
+  assert.equal(openedWorkspaceId, 'folder:ws-2')
+
+  // 2) 一键切换到 fresh@example.com (queue 策略)：
+  //    空闲对话框 7101 立即切换释放，回复中对话框 7102 自动进入等待队列！
+  let snap = await worker.request('switcher.switchAll', {
+    targetAccountId: 'acc-2',
+    workingPolicy: 'queue',
+    onlyOutdated: true
+  })
+  assert.equal(sys.events.includes('select:acc-2'), true)
+  assert.equal(sys.events.includes('stop:7101'), true)
+  assert.equal(sys.events.includes('stop:7102'), false)
+  assert.equal(snap.queuedCount, 1)
+  const queuedBusy = snap.terminals.find((t) => t.pid === 7102)!
+  assert.equal(queuedBusy.queuedTargetEmail, 'fresh@example.com')
+
+  // 3) 模拟后台旧对话框 7102 在回复中途刷新了 OAuth Token 把全局 activeAccountId 改回 acc-1：
+  //    healAccountDrift 立即把系统凭证重新锁回 acc-2，防止新开对话框报 "The native Antigravity account changed"！
+  sys.accountState.activeAccountId = 'acc-1'
+  sys.accountState.currentEmail = 'old@example.com'
+  await service.healAccountDrift('acc-2', 'fresh@example.com', 'old@example.com')
+  assert.equal(sys.accountState.activeAccountId, 'acc-2')
+  assert.equal(sys.accountState.selectedAccountId, 'acc-2')
+
+  // 4) 对话框 7102 回复结束变为 done，仅带 paneKey（无 terminalId）触发事件并排空队列：
+  sys.agents[1]!.state = 'done'
+  await service.handleAgentStatusChanged({
+    paneKey: 'structured-agent-session-chat-busy-2:leaf-b',
+    state: 'done'
+  })
+  await service.drainAnyIdleQueued()
+  snap = await service.getSnapshot({ refresh: true, refreshAccounts: false })
+  assert.equal(sys.events.includes('stop:7102'), true)
+  assert.equal(snap.queuedCount, 0)
+  assert.equal(snap.acpOutdatedCount, 0)
+
+  // 5) 验证独立单账号模式（orca-signin）与真实本机未登录载荷（chatUsesAgy=false, chatAgySignedOut=true, chatGoogleSignInInUse='agy'）：
+  sys.accountState.chatUsesAgy = false
+  sys.accountState.chatGoogleSignInInUse = 'orca'
+  snap = await service.refreshSnapshot({ refreshAccounts: true })
+  assert.equal(snap.chatBackendMode, 'orca-managed')
+  assert.equal(snap.chatIsolationReason, 'orca-signin')
+
+  sys.accountState.chatUsesAgy = false
+  sys.accountState.chatGoogleSignInInUse = 'agy'
+  sys.accountState.chatAgySignedOut = true
+  snap = await service.refreshSnapshot({ refreshAccounts: true })
+  assert.equal(snap.chatBackendMode, 'unknown')
+  assert.equal(snap.chatIsolationReason, 'agy-signed-out')
+
+  service.dispose()
+  await worker.deactivate()
+})
+
+test('[v0.2.9-blind-review-1] P1-1/P1-4/P2-2/P2-3：heal 不抹除恢复命令、锁内重拉不覆盖用户新选、带空格 --gemini-dir 与未识别对话诚实提示', async () => {
+  // P2-2: macOS 默认带空格 Application Support 路径的 --gemini-dir 隔离目录识别
+  assert.equal(
+    hasIsolatedChatGeminiDir(
+      'agy acp --gemini-dir "/Users/me/Library/Application Support/orca/antigravity-agy-chat" --dangerously-skip-permissions'
+    ),
+    true
+  )
+  assert.equal(
+    hasIsolatedChatGeminiDir(
+      'agy acp --gemini-dir=/Users/me/Library/Application Support/orca/antigravity-chat'
+    ),
+    true
+  )
+  assert.equal(hasIsolatedChatGeminiDir('agy acp --model gemini-2.5-pro'), false)
+
+  const now = Date.now()
+  const sys = new FakeSystemAdapter({
+    accountState: {
+      activeAccountId: 'acc-1',
+      selectedAccountId: 'acc-1',
+      currentEmail: 'old@example.com',
+      chatUsesAgy: true,
+      accounts: [
+        {
+          id: 'acc-1',
+          email: 'old@example.com',
+          label: null,
+          status: 'ok',
+          sessionUsedPercent: 90,
+          sessionResetsAt: now + 3600_000,
+          weeklyUsedPercent: 50,
+          weeklyResetsAt: now + 86400_000,
+          buckets: []
+        },
+        {
+          id: 'acc-2',
+          email: 'fresh@example.com',
+          label: null,
+          status: 'ok',
+          sessionUsedPercent: 5,
+          sessionResetsAt: now + 3600_000,
+          weeklyUsedPercent: 10,
+          weeklyResetsAt: now + 86400_000,
+          buckets: []
+        },
+        {
+          id: 'acc-3',
+          email: 'third@example.com',
+          label: null,
+          status: 'ok',
+          sessionUsedPercent: 0,
+          sessionResetsAt: now + 3600_000,
+          weeklyUsedPercent: 0,
+          weeklyResetsAt: now + 86400_000,
+          buckets: []
+        }
+      ]
+    },
+    terminals: [
+      {
+        handle: 'term_recover',
+        paneKey: 'tab1:leaf1',
+        worktreeId: 'folder:ws-1',
+        worktreePath: '/work/recover-app',
+        title: 'CLI 会话',
+        connected: true,
+        writable: true,
+        agentIdentity: 'agy'
+      }
+    ],
+    agents: [
+      {
+        terminalId: 'term_recover',
+        paneKey: 'tab1:leaf1',
+        worktreeId: 'folder:ws-1',
+        workspace: 'recover-app',
+        repo: null,
+        agent: 'antigravity',
+        state: 'done',
+        title: 'CLI 会话'
+      },
+      {
+        orcaSessionId: 'chat-unknown-email',
+        kind: 'structured',
+        terminalId: null,
+        paneKey: 'structured-agent-session-chat-unknown-email:leaf-u',
+        worktreeId: 'folder:ws-1',
+        workspace: 'recover-app',
+        repo: null,
+        agent: 'antigravity',
+        state: 'done',
+        title: '刚启动尚未刷出邮箱的对话'
+      }
+    ],
+    processes: [
+      {
+        pid: 8201,
+        ppid: 100,
+        processKind: 'cli',
+        parentIsShell: true,
+        hasAgyAncestor: false,
+        startedAtText: 'Thu Nov 26 11:00:00 2026',
+        command: 'agy --conversation 11111111-2222-3333-4444-555555555555',
+        terminalHandle: 'term_recover',
+        worktreeId: 'folder:ws-1',
+        conversationId: '11111111-2222-3333-4444-555555555555',
+        authEmail: 'old@example.com'
+      },
+      {
+        pid: 8202,
+        ppid: 10,
+        processKind: 'acp',
+        parentIsShell: false,
+        hasAgyAncestor: false,
+        startedAtText: 'Thu Nov 26 11:01:00 2026',
+        command: 'agy acp',
+        terminalHandle: null,
+        worktreeId: 'folder:ws-1',
+        conversationId: null,
+        authEmail: null,
+        orcaSessionId: 'chat-unknown-email',
+        isStructuredSession: true,
+        isManagedAcpServer: false
+      }
+    ]
+  })
+
+  const host = mockHost({
+    settings: { workingPolicy: 'queue', autoGuardDrift: true, notifyOnComplete: false },
+    results: { 'statusBar.update': { ok: true }, 'notifications.show': { ok: true } }
+  })
+
+  let service!: SwitcherService
+  const worker = await mountWorker(
+    {
+      default(orca: OrcaWorkerApi) {
+        service = createWorker(orca, sys)
+      }
+    },
+    { host }
+  )
+
+  // 1) P1-1: 模拟切号时终端原位拉起失败产生 recoveryCommands，随后触发 healAccountDrift 绝不抹掉恢复命令！
+  sys.failSendTerminal = true
+  let snap = await worker.request('switcher.switchAll', {
+    targetAccountId: 'acc-2',
+    workingPolicy: 'queue',
+    onlyOutdated: true
+  })
+  assert.equal(snap.lastOperation?.recoveryCommands.length, 1)
+  const savedRecoveryCmd = snap.lastOperation!.recoveryCommands[0]!.command
+
+  sys.accountState.activeAccountId = 'acc-1'
+  sys.accountState.currentEmail = 'old@example.com'
+  await service.healAccountDrift('acc-2', 'fresh@example.com', 'old@example.com')
+  snap = await service.getSnapshot({ refresh: false })
+  assert.equal(sys.accountState.activeAccountId, 'acc-2')
+  assert.equal(snap.lastOperation?.recoveryCommands.length, 1)
+  assert.equal(snap.lastOperation?.recoveryCommands[0]?.command, savedRecoveryCmd)
+
+  // 2) P1-4: 用户已在 Orca 设置中主动改选 acc-3，过期缓存触发的 heal('acc-2') 锁内重拉发现后必须放弃回滚！
+  sys.events.length = 0
+  sys.accountState.selectedAccountId = 'acc-3'
+  sys.accountState.activeAccountId = 'acc-3'
+  sys.accountState.currentEmail = 'third@example.com'
+  await service.healAccountDrift('acc-2', 'fresh@example.com', 'old@example.com')
+  assert.equal(sys.events.includes('select:acc-2'), false)
+  assert.equal(sys.accountState.selectedAccountId, 'acc-3')
+
+  // 3) P2-3: 此时仅剩 authEmail=null 的对话 8202（unknownAuthCount=1），切号摘要绝不假报“全部对话已是当前账号”
+  sys.failSendTerminal = false
+  snap = await worker.request('switcher.switchAll', {
+    targetAccountId: 'acc-2',
+    workingPolicy: 'queue',
+    onlyOutdated: true
+  })
+  assert.equal(snap.unknownAuthCount, 1)
+  assert.ok(snap.lastOperation?.message.includes('另有 1 个对话账号识别中，暂未同步'))
+  assert.equal(snap.lastOperation?.message.includes('全部对话已是当前账号'), false)
+
+  service.dispose()
+  await worker.deactivate()
+})
+
+test('[v0.2.9-blind-review-2] P1-2/P1-3：排队补切扫描期转忙不误杀、Orca owesWork 保护与兜底二次复核拦截', async () => {
+  const now = Date.now()
+  const sys = new FakeSystemAdapter({
+    accountState: {
+      activeAccountId: 'acc-1',
+      selectedAccountId: 'acc-1',
+      currentEmail: 'old@example.com',
+      chatUsesAgy: true,
+      accounts: [
+        {
+          id: 'acc-1',
+          email: 'old@example.com',
+          label: null,
+          status: 'ok',
+          sessionUsedPercent: 80,
+          sessionResetsAt: now + 3600_000,
+          weeklyUsedPercent: 40,
+          weeklyResetsAt: now + 86400_000,
+          buckets: []
+        },
+        {
+          id: 'acc-2',
+          email: 'fresh@example.com',
+          label: null,
+          status: 'ok',
+          sessionUsedPercent: 0,
+          sessionResetsAt: now + 3600_000,
+          weeklyUsedPercent: 0,
+          weeklyResetsAt: now + 86400_000,
+          buckets: []
+        }
+      ]
+    },
+    terminals: [],
+    agents: [
+      {
+        orcaSessionId: 'chat-owes-work',
+        kind: 'structured',
+        terminalId: null,
+        paneKey: 'structured-agent-session-chat-owes-work:leaf-1',
+        worktreeId: 'folder:ws-a',
+        workspace: 'alpha',
+        repo: null,
+        agent: 'antigravity',
+        state: 'done',
+        title: '受 Orca owesWork 保护的对话'
+      },
+      {
+        orcaSessionId: 'chat-race-busy',
+        kind: 'structured',
+        terminalId: null,
+        paneKey: 'structured-agent-session-chat-race-busy:leaf-2',
+        worktreeId: 'folder:ws-b',
+        workspace: 'beta',
+        repo: null,
+        agent: 'antigravity',
+        state: 'working',
+        title: '即将追问转忙的排队对话'
+      }
+    ],
+    processes: [
+      {
+        pid: 8301,
+        ppid: 10,
+        processKind: 'acp',
+        parentIsShell: false,
+        hasAgyAncestor: false,
+        startedAtText: 'Thu Nov 26 11:10:00 2026',
+        command: 'agy acp',
+        terminalHandle: null,
+        worktreeId: 'folder:ws-a',
+        conversationId: null,
+        authEmail: 'old@example.com',
+        orcaSessionId: 'chat-owes-work',
+        isStructuredSession: true,
+        isManagedAcpServer: false,
+        // 显式携带 .gemini，且 select 后 Orca 未杀它 -> 代表命中 Orca owesWork 保护
+        hasDotGeminiHome: true
+      },
+      {
+        pid: 8302,
+        ppid: 10,
+        processKind: 'acp',
+        parentIsShell: false,
+        hasAgyAncestor: false,
+        startedAtText: 'Thu Nov 26 11:11:00 2026',
+        command: 'agy acp',
+        terminalHandle: null,
+        worktreeId: 'folder:ws-b',
+        conversationId: null,
+        authEmail: 'old@example.com',
+        orcaSessionId: 'chat-race-busy',
+        isStructuredSession: true,
+        isManagedAcpServer: false,
+        hasDotGeminiHome: false
+      }
+    ]
+  })
+
+  const host = mockHost({
+    settings: { workingPolicy: 'queue', autoGuardDrift: false, notifyOnComplete: false },
+    results: { 'statusBar.update': { ok: true }, 'notifications.show': { ok: true } }
+  })
+
+  let service!: SwitcherService
+  const worker = await mountWorker(
+    {
+      default(orca: OrcaWorkerApi) {
+        service = createWorker(orca, sys)
+      }
+    },
+    { host }
+  )
+
+  // 1) P1-3: 批量 queue 换号时，8301 虽显示 done 但带 .gemini 且 Orca 未自动释放（owesWork 保护）-> 绝不 SIGTERM，转入队列！
+  let snap = await worker.request('switcher.switchAll', {
+    targetAccountId: 'acc-2',
+    workingPolicy: 'queue',
+    onlyOutdated: true
+  })
+  assert.equal(sys.events.includes('stop:8301'), false)
+  assert.equal(sys.events.includes('stop:8302'), false)
+  assert.equal(snap.queuedCount, 2)
+
+  // 2) P1-2: 模拟 8302 短暂变为 done 触发 drainAnyIdleQueued，但在进入 switchAll 内部扫描时用户追问又变回 working：
+  //    因为 drainAnyIdleQueued 使用 workingPolicy: 'queue'，8302 绝不被强杀且继续保留在队列！
+  sys.agents[1]!.state = 'done'
+  let agentScanCalls = 0
+  sys.onListOrcaAgents = () => {
+    agentScanCalls += 1
+    // 第 1 次是 drainAnyIdleQueued 预检（看到 done），第 2 次是 switchAll 锁内重扫（此时已追问变为 working！）
+    if (agentScanCalls >= 2) {
+      sys.agents[1]!.state = 'working'
+    }
+  }
+  await service.drainAnyIdleQueued()
+  sys.onListOrcaAgents = undefined
+  assert.equal(sys.events.includes('stop:8302'), false)
+  snap = await service.getSnapshot({ refresh: true, refreshAccounts: false })
+  assert.equal(snap.queuedCount, 2)
+
+  // 3) 单点显式点击「立即切到当前号」（restartOne force=true）仍可由用户自主强停 8301：
+  snap = await worker.request('switcher.restartOne', {
+    sessionKey: 'acp:chat-owes-work',
+    force: true
+  })
+  assert.equal(sys.events.includes('stop:8301'), true)
+  assert.equal(snap.queuedCount, 1)
 
   service.dispose()
   await worker.deactivate()
