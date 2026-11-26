@@ -5,14 +5,18 @@ import {
   buildRestartCommand,
   classifyAgyCommand,
   compareAccountsByHeadroom,
+  compareSemver,
   computeStatusBar,
   computeSwitchImpact,
+  extractApproveCommand,
+  extractLatestTagVersion,
   formatResetCountdown,
   formatSnapshotAge,
   isAgyFamilyBinary,
   isManagedAcpBinary,
   isManagedAcpCommand,
   isQuotaWindowExpired,
+  parseSemver,
   pickBestAccount,
   resolveAccountQuotaPools,
   resolvePrimaryQuota,
@@ -25,6 +29,8 @@ import {
   parseAccountBuckets,
   parseLsofOutput,
   parsePsEnvOutput,
+  type InstalledPluginMeta,
+  type PluginUpdateExecResult,
   type QueryResult,
   type RawAccountState,
   type RawAgyProcess,
@@ -49,6 +55,9 @@ class FakeSystemAdapter implements SystemAdapter {
   processes: RawAgyProcess[]
   alivePids = new Set<number>()
   existingPaths = new Set<string>(['/work/valid-dir'])
+  getSelfPluginMeta?: () => Promise<InstalledPluginMeta | null>
+  fetchLatestRemoteVersion?: () => Promise<string | null>
+  runPluginUpdate?: (pluginKey: string) => Promise<PluginUpdateExecResult>
 
   constructor(init: {
     accountState: RawAccountState
@@ -341,12 +350,14 @@ test('[H-5] pickBestAccount 拒绝返回全部异常的坏账号', () => {
   assert.equal(pickBestAccount(broken), null)
 })
 
-test('[UI精细度] formatResetCountdown、isQuotaWindowExpired 与 formatSnapshotAge 精确到分钟并正确处理已过期窗口', () => {
+test('[UI精细度] formatResetCountdown、isQuotaWindowExpired 与 formatSnapshotAge 精确到分钟并正确处理已重置与未开窗(0)', () => {
   const base = new Date(2026, 10, 22, 22, 30, 0).getTime()
   assert.equal(isQuotaWindowExpired(base - 60_000, base), true)
   assert.equal(isQuotaWindowExpired(base, base), true)
   assert.equal(isQuotaWindowExpired(base + 1, base), false)
   assert.equal(isQuotaWindowExpired(null, base), false)
+  assert.equal(isQuotaWindowExpired(0, base), false)
+  assert.equal(isQuotaWindowExpired(-100, base), false)
 
   assert.equal(formatSnapshotAge(base - 20_000, base), '刚刚')
   assert.equal(formatSnapshotAge(base - 15 * 60_000, base), '15分钟前')
@@ -354,14 +365,15 @@ test('[UI精细度] formatResetCountdown、isQuotaWindowExpired 与 formatSnapsh
   assert.equal(formatSnapshotAge(base - 3 * 86400_000, base), '3天前')
   assert.equal(formatSnapshotAge(null, base), null)
 
-  assert.equal(formatResetCountdown(base - 60_000, base), '窗口已过 · 切入刷新')
+  assert.equal(formatResetCountdown(0, base), '—')
+  assert.equal(formatResetCountdown(base - 60_000, base), '切换后更新')
   assert.equal(
     formatResetCountdown(base - 60_000, base, 'short', { isActive: true }),
-    '窗口已过 · 点刷新'
+    '待刷新'
   )
   assert.equal(
     formatResetCountdown(base - 60_000, base, 'full', { isActive: true }),
-    '窗口已过，待刷新'
+    '已重置，待刷新'
   )
   assert.equal(formatResetCountdown(base + 42 * 60_000, base), '42分钟 · 23:12')
   assert.equal(
@@ -1180,7 +1192,7 @@ test('[v0.2.6] computeStatusBar 在当前号 5h 窗口已过重置时不触发 1
   assert.equal(sb.tone, 'neutral')
   assert.ok(sb.text.includes('待刷新'))
   assert.equal(sb.text.includes('100%'), false)
-  assert.ok(sb.tooltip.includes('5h 已过重置·上轮100%（待刷新）'))
+  assert.ok(sb.tooltip.includes('5h 已重置（待刷新）'))
   assert.ok(sb.text.length <= 64)
   assert.ok(sb.tooltip.length <= 256)
 })
@@ -1469,7 +1481,7 @@ test('[v0.2.8] parseAccountBuckets 与分池解析严格隔离 Gemini 主池与 
   assert.ok(sb.text.length <= 64)
   assert.ok(sb.tooltip.length <= 256)
 
-  // 6) parseAccountBuckets 结构化 windowMinutes/windowName 优先，不被 name 中的字样误判窗口
+  // 6) parseAccountBuckets 结构化 windowMinutes/windowName 优先，且 resetsAt=0 归一为 null
   const structPriority = parseAccountBuckets([
     {
       name: 'Model-Week-Edition · 5h',
@@ -1478,11 +1490,31 @@ test('[v0.2.8] parseAccountBuckets 与分池解析严格隔离 Gemini 主池与 
       windowMinutes: 300,
       usedPercent: 33,
       resetsAt: gem5hReset
+    },
+    {
+      name: 'Claude and GPT models · Five Hour',
+      group: 'Claude and GPT models',
+      windowName: 'Five Hour Limit Remaining',
+      windowMinutes: 300,
+      usedPercent: 0,
+      resetsAt: 0
+    },
+    {
+      name: 'Claude and GPT models · Weekly',
+      group: 'Claude and GPT models',
+      windowName: 'Weekly Limit Remaining',
+      windowMinutes: 10080,
+      usedPercent: 0,
+      resetsAt: 0
     }
   ])
-  assert.equal(structPriority.length, 1)
+  assert.equal(structPriority.length, 2)
   assert.equal(structPriority[0]!.sessionUsedPercent, 33)
   assert.equal(structPriority[0]!.weeklyUsedPercent, null)
+  assert.equal(structPriority[1]!.sessionUsedPercent, 0)
+  assert.equal(structPriority[1]!.sessionResetsAt, null)
+  assert.equal(structPriority[1]!.weeklyUsedPercent, 0)
+  assert.equal(structPriority[1]!.weeklyResetsAt, null)
 
   // 7) 无 buckets 的老账号安全回退顶层字段，不贴错误池名
   const legacyPrimary = resolvePrimaryQuota({
@@ -1578,6 +1610,118 @@ test('[v0.2.8] quickSyncCommand 仅在主池 5h 满额时自动换号，不被�
   const msg = await service.quickSyncCommand()
   assert.equal(sys.events.length, 0)
   assert.ok(msg.includes('全部已同步'))
+
+  service.dispose()
+  await worker.deactivate()
+})
+
+test('[v0.2.9] 新版本检测、单次通知去重、一键更新与新权限确认命令兜底', async () => {
+  // 1) 纯函数：语义化版本比较与 git ls-remote tag 解析（跳过预发布版）
+  assert.deepEqual(parseSemver('v0.2.10'), [0, 2, 10])
+  assert.equal(parseSemver('v0.3.0-beta.1'), null)
+  assert.ok(compareSemver('0.2.10', '0.2.9') > 0)
+  assert.ok(compareSemver('0.3.0', '0.2.10') > 0)
+  assert.equal(compareSemver('0.2.9', '0.2.9'), 0)
+
+  const tagsRaw = [
+    '781ceb8249b8782558aa7f047eb5bc5440d513f8\trefs/tags/v0.2.7',
+    '5d0753074259ad2002e5d63ad80149ccfda004a5\trefs/tags/v0.2.9',
+    'aaaaeb8249b8782558aa7f047eb5bc5440d513f8\trefs/tags/v0.2.10',
+    'bbbbeb8249b8782558aa7f047eb5bc5440d513f8\trefs/tags/v0.4.0-rc.1'
+  ].join('\n')
+  assert.equal(extractLatestTagVersion(tagsRaw), '0.2.10')
+
+  assert.equal(
+    extractApproveCommand(
+      'Approval needed',
+      'github.lyezhucc.agy-account-switcher',
+      'sha256-abc123='
+    ),
+    'orca plugin update github.lyezhucc.agy-account-switcher --approve sha256-abc123='
+  )
+
+  // 2) 服务层：GitHub 安装用户发现新版本 -> 桌面通知仅弹 1 次 -> 审批兜底 -> 正常一键升级
+  const sys = makeFixture()
+  let installedMeta: InstalledPluginMeta = {
+    pluginKey: 'github.lyezhucc.agy-account-switcher',
+    version: '0.2.9',
+    sourceKind: 'git',
+    sourceRef: 'lyezhucc/orca-agy-account-switcher',
+    localManifestVersion: null
+  }
+  let remoteLatest = '0.3.0'
+  let updateResult: PluginUpdateExecResult = {
+    ok: false,
+    needsApproval: true,
+    newVersion: null,
+    message: '此版本申请了新权限',
+    approvalCommand:
+      'orca plugin update github.lyezhucc.agy-account-switcher --approve sha256-newfp='
+  }
+  sys.getSelfPluginMeta = async () => installedMeta
+  sys.fetchLatestRemoteVersion = async () => remoteLatest
+  sys.runPluginUpdate = async (pluginKey: string) => {
+    sys.events.push(`pluginUpdate:${pluginKey}`)
+    return updateResult
+  }
+
+  let notifyCount = 0
+  const host = mockHost({
+    settings: { workingPolicy: 'queue', notifyOnComplete: false },
+    results: {
+      'statusBar.update': { ok: true },
+      'notifications.show': () => {
+        notifyCount += 1
+        return { ok: true }
+      }
+    }
+  })
+
+  let service!: SwitcherService
+  const worker = await mountWorker(
+    {
+      default(orca: OrcaWorkerApi) {
+        service = createWorker(orca, sys)
+      }
+    },
+    { host }
+  )
+
+  await service.refreshSnapshot({ refreshAccounts: false })
+  await service.checkForPluginUpdate({ force: true })
+  let snap = await service.getSnapshot()
+  assert.equal(snap.pluginVersion, '0.2.9')
+  assert.equal(snap.updateInfo?.latestVersion, '0.3.0')
+  assert.equal(snap.updateInfo?.canOneClickUpdate, true)
+  assert.equal(notifyCount, 1)
+
+  // 再次检查同一版本不重复弹桌面通知
+  await service.checkForPluginUpdate({ force: true })
+  assert.equal(notifyCount, 1)
+
+  // 首次点击更新模拟需要确认新权限 -> 返回 approval_required 且快照保留 approvalCommand
+  const resApproval = await service.applyPluginUpdate()
+  assert.equal(resApproval.status, 'approval_required')
+  snap = await service.getSnapshot()
+  assert.equal(
+    snap.updateInfo?.approvalCommand,
+    'orca plugin update github.lyezhucc.agy-account-switcher --approve sha256-newfp='
+  )
+
+  // 随后模拟免审批直接升级成功 -> 清空 updateInfo 且版本号升至 0.3.0
+  updateResult = {
+    ok: true,
+    needsApproval: false,
+    newVersion: '0.3.0',
+    message: '已更新到最新版本 v0.3.0',
+    approvalCommand: null
+  }
+  installedMeta = { ...installedMeta, version: '0.3.0' }
+  const resOk = await service.applyPluginUpdate()
+  assert.equal(resOk.status, 'updated')
+  snap = await service.getSnapshot()
+  assert.equal(snap.pluginVersion, '0.3.0')
+  assert.equal(snap.updateInfo, null)
 
   service.dispose()
   await worker.deactivate()

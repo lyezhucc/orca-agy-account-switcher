@@ -148,6 +148,14 @@ const outdatedAlertSnapshot: SwitcherSnapshot = {
   acpOutdatedCount: 1,
   queuedCount: 1,
   chatBackendMode: 'host-agy',
+  pluginVersion: '0.2.9',
+  updateInfo: {
+    currentVersion: '0.2.9',
+    latestVersion: '0.3.0',
+    pluginKey: 'github.lyezhucc.agy-account-switcher',
+    sourceKind: 'git',
+    canOneClickUpdate: true
+  },
   accounts: syncedSnapshot.accounts.map((a) => (a.id === 'acc-1' ? { ...a, terminalCount: 2 } : a)),
   terminals: [
     {
@@ -183,7 +191,7 @@ const outdatedAlertSnapshot: SwitcherSnapshot = {
       authEmail: 'bob@example.com',
       commandPreview: 'agy acp --dangerously-skip-permissions',
       canRestartInPlace: false,
-      restartBlockedReason: '原生 Chat 干活中（共用系统账号），需等其空闲或手动重开',
+      restartBlockedReason: '原生 Chat 正在回复中（共用系统账号），需等其完成或手动重开',
       isExternal: false,
       agentState: 'working',
       isOutdated: true,
@@ -201,10 +209,10 @@ const outdatedAlertSnapshot: SwitcherSnapshot = {
     skippedCount: 0,
     failedCount: 0,
     rolledBackCount: 0,
-    message: '已切到 alice，原地换号 3 个，排队等空闲 1 个',
+    message: '已切换到 alice，已更新 3 个终端，1 个等待回复完成后切换',
     details: [
       '✓ web-app · 继续吧（已续接原对话）',
-      '⏳ data-tools · 分析接口性能（干活中，已加入空闲自动切队列）'
+      '⏳ data-tools · 分析接口性能（运行中，将在回复完成后自动切换）'
     ],
     recoveryCommands: []
   }

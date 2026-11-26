@@ -29,6 +29,7 @@ import {
 } from 'orca'
 import {
   compareAccountsByHeadroom,
+  compareSemver,
   computeSwitchImpact,
   emailsEqual,
   formatResetCountdown,
@@ -50,11 +51,17 @@ interface PendingSwitchConfirm {
   targetEmail: string
 }
 
+interface NoticeBanner {
+  title: string
+  body: string
+}
+
 const snapshotAtom = atom<SwitcherSnapshot | null>(null)
 const actionErrorAtom = atom<string | null>(null)
-const noticeInfoAtom = atom<string | null>(null)
+const noticeInfoAtom = atom<NoticeBanner | null>(null)
 const refreshingAtom = atom<boolean>(false)
 const pendingActionAtom = atom<boolean>(false)
+const updatingPluginAtom = atom<boolean>(false)
 const confirmKeyAtom = atom<string | null>(null)
 const selectedTargetIdAtom = atom<string | null>(null)
 const pendingSwitchAtom = atom<PendingSwitchConfirm | null>(null)
@@ -157,6 +164,70 @@ async function focusTerminal(terminalId: string): Promise<void> {
   }
 }
 
+async function applyPluginUpdate(expectedVersion: string): Promise<void> {
+  if (read(updatingPluginAtom) || read(pendingActionAtom)) return
+  clearConfirm()
+  set(updatingPluginAtom, true)
+  set(actionErrorAtom, null)
+  try {
+    const res = await plugin.request('switcher.applyUpdate', undefined, {
+      timeoutMs: 65000,
+      signal: panelSignal
+    })
+    if (res.status === 'updated') {
+      const snap = await plugin.request(
+        'switcher.getState',
+        { refresh: false },
+        { timeoutMs: 15000, signal: panelSignal }
+      )
+      setSnapshotIfNewer(snap)
+      set(noticeInfoAtom, {
+        title: '更新完成',
+        body: res.message || `已更新到最新版本 v${res.newVersion ?? expectedVersion}`
+      })
+      return
+    }
+    if (res.status === 'approval_required') {
+      const snap = await plugin.request(
+        'switcher.getState',
+        { refresh: false },
+        { timeoutMs: 15000, signal: panelSignal }
+      )
+      setSnapshotIfNewer(snap)
+      return
+    }
+    set(actionErrorAtom, res.message)
+  } catch (err: unknown) {
+    if (panelSignal?.aborted) return
+    // 热升级成功时 Orca 会重启当前旧 Worker 导致本次 IPC 断开；等待新 Worker 就绪后复核版本
+    await new Promise((r) => setTimeout(r, 1500))
+    if (panelSignal?.aborted) return
+    try {
+      const nextSnap = await plugin.request(
+        'switcher.getState',
+        { refresh: false },
+        { timeoutMs: 15000, signal: panelSignal }
+      )
+      setSnapshotIfNewer(nextSnap)
+      if (
+        !nextSnap.updateInfo ||
+        (nextSnap.pluginVersion && compareSemver(nextSnap.pluginVersion, expectedVersion) >= 0)
+      ) {
+        set(noticeInfoAtom, {
+          title: '更新完成',
+          body: `已更新到最新版本 v${nextSnap.pluginVersion ?? expectedVersion}`
+        })
+        return
+      }
+    } catch {
+      // ignore fallback probe error
+    }
+    set(actionErrorAtom, err instanceof Error ? err.message : String(err))
+  } finally {
+    set(updatingPluginAtom, false)
+  }
+}
+
 function quotaTextTone(percent: number | null): 'neutral' | 'warning' | 'danger' {
   if (percent === null) return 'neutral'
   if (percent >= 100) return 'danger'
@@ -170,22 +241,22 @@ function agentStateLabel(t: AgyTerminalInfo): {
 } {
   if (t.processKind === 'acp') {
     if (isManagedChatTerminal(t)) {
-      if (t.agentState === 'working') return { text: '托管·干活', tone: 'accent' }
-      if (t.agentState === 'blocked') return { text: '托管·待审', tone: 'warning' }
-      return { text: '独立托管', tone: 'neutral' }
+      if (t.agentState === 'working') return { text: '独立·运行中', tone: 'accent' }
+      if (t.agentState === 'blocked') return { text: '独立·待确认', tone: 'warning' }
+      return { text: '独立账号', tone: 'neutral' }
     }
-    if (t.agentState === 'working') return { text: 'Chat·干活', tone: 'accent' }
-    if (t.agentState === 'blocked') return { text: 'Chat·待审', tone: 'warning' }
+    if (t.agentState === 'working') return { text: 'Chat·运行中', tone: 'accent' }
+    if (t.agentState === 'blocked') return { text: 'Chat·待确认', tone: 'warning' }
     if (t.agentState === 'done' || t.agentState === 'idle' || t.agentState === 'waiting') {
       return { text: 'Chat·空闲', tone: 'success' }
     }
     return { text: '原生Chat', tone: 'warning' }
   }
   if (t.isExternal) return { text: '外部终端', tone: 'warning' }
-  if (t.queuedTargetEmail) return { text: '排队中', tone: 'accent' }
-  if (t.agentState === 'working') return { text: '干活中', tone: 'accent' }
+  if (t.queuedTargetEmail) return { text: '等待切换', tone: 'accent' }
+  if (t.agentState === 'working') return { text: '运行中', tone: 'accent' }
   if (t.agentState === 'blocked') return { text: '待确认', tone: 'warning' }
-  if (t.agentState === 'unknown') return { text: '未知', tone: 'warning' }
+  if (t.agentState === 'unknown') return { text: '状态未知', tone: 'warning' }
   return { text: '空闲', tone: 'success' }
 }
 
@@ -198,7 +269,7 @@ interface SecondaryPoolView {
   hasUsage: boolean
 }
 
-/** 格式化副池（如 Claude/GPT）活跃窗口的紧凑重置提示；全 0 或已过期返回 null 保持卡片极简。 */
+/** 格式化副池（如 Claude/GPT）活跃窗口的紧凑重置提示；全 0 或已重置返回 null 保持卡片极简。 */
 function formatSecondaryResetHint(
   pool: ResolvedQuotaPool,
   nowMs: number,
@@ -228,7 +299,7 @@ function formatSecondaryResetHint(
   return null
 }
 
-/** 将副模型池格式化为展示视图，识别各自窗口过期态，绝不让过期峰值永久标红或隐藏 0% 池。 */
+/** 将副模型池格式化为展示视图，识别各自窗口已重置状态，绝不让旧周期峰值误报红警或把 0% 未用池标为已重置。 */
 function formatSecondaryPools(
   pools: readonly ResolvedQuotaPool[],
   nowMs: number,
@@ -242,8 +313,8 @@ function formatSecondaryPools(
     if (s === null && w === null) continue
     const sExpired = isQuotaWindowExpired(b.sessionResetsAt, nowMs)
     const wExpired = isQuotaWindowExpired(b.weeklyResetsAt, nowMs)
-    const sTxt = sExpired ? '已过重置' : s === null ? '—' : `${clampPercent(s)}%`
-    const wTxt = wExpired ? '已过重置' : w === null ? '—' : `${clampPercent(w)}%`
+    const sTxt = sExpired ? '已重置' : s === null ? '—' : `${clampPercent(s)}%`
+    const wTxt = wExpired ? '已重置' : w === null ? '—' : `${clampPercent(w)}%`
     const activeMaxPct = Math.max(sExpired ? 0 : (s ?? 0), wExpired ? 0 : (w ?? 0))
     result.push({
       key: b.bucketGroup ?? name,
@@ -266,6 +337,9 @@ export function setup(ctx: PanelContext): void {
     {
       dispose() {
         clearConfirm()
+        set(updatingPluginAtom, false)
+        set(refreshingAtom, false)
+        set(pendingActionAtom, false)
         panelSignal = undefined
       }
     }
@@ -274,9 +348,9 @@ export function setup(ctx: PanelContext): void {
 }
 
 function policyDisplayName(policy: WorkingPolicy): string {
-  if (policy === 'force') return '立刻中断强切'
-  if (policy === 'skip') return '跳过不动'
-  return '等空闲自动换号'
+  if (policy === 'force') return '立即中断并切换'
+  if (policy === 'skip') return '暂不切换'
+  return '等当前回复完成后切换'
 }
 
 function AccountRow(
@@ -303,28 +377,30 @@ function AccountRow(
   const isErrorAccount = isAccountError(account)
   const isDraftSelected = selectedTargetId === account.id
 
-  const sessionReset = formatResetCountdown(primary.sessionResetsAt, snap.updatedAt, 'short', {
+  const rawSessionReset = formatResetCountdown(primary.sessionResetsAt, snap.updatedAt, 'short', {
     isActive: account.isActive
   })
-  const weeklyReset = formatResetCountdown(primary.weeklyResetsAt, snap.updatedAt, 'short', {
+  const rawWeeklyReset = formatResetCountdown(primary.weeklyResetsAt, snap.updatedAt, 'short', {
     isActive: account.isActive
   })
+  const sessionReset = rawSessionReset === '—' ? '' : rawSessionReset
+  const weeklyReset = rawWeeklyReset === '—' ? '' : rawWeeklyReset
   const extraPools = formatSecondaryPools(secondary, snap.updatedAt, account.isActive)
   const primaryPrefix = primary.name && extraPools.length > 0 ? `${primary.name} ` : ''
 
-  const statusMeta = [
-    account.isActive ? '当前' : null,
-    account.terminalCount > 0 ? `${account.terminalCount} 进程` : null
-  ]
-    .filter(Boolean)
-    .join(' · ')
+  const statusMeta = account.isActive
+    ? '当前使用'
+    : account.terminalCount > 0
+      ? `${account.terminalCount} 个终端`
+      : ''
 
   const snapshotAge = !account.isActive ? formatSnapshotAge(account.usageUpdatedAt, snap.updatedAt) : null
-  const footerLeft = [account.label ? account.email : null, snapshotAge ? `快照 · ${snapshotAge}` : null]
+  const footerLeft = [account.label ? account.email : null, snapshotAge ? `更新于 ${snapshotAge}` : null]
     .filter(Boolean)
     .join(' · ')
 
   const canSelectAsTarget = !locked && !isCurrentAndAllClean && !onlyExternalLeft
+  const showFooterRow = Boolean(footerLeft) || !isCurrentAndAllClean
 
   return (
     <Box
@@ -336,13 +412,13 @@ function AccountRow(
       radius="md"
       background={isDraftSelected ? 'accent' : 'card'}
     >
-      {/* 卡头：用户名 + 当前/终端或未读/异常标注，选中为待切目标时卡片整卡高亮 */}
+      {/* 卡头：用户名 + 当前使用 / 残留终端数 / 未读取 / 异常标注 */}
       <Row justify="between" align="center" gap="xs">
         <Text weight="semibold" size="sm" truncate>
           {account.label || shortEmail(account.email)}
         </Text>
         {isErrorAccount ? (
-          <Badge tone="danger">额度异常</Badge>
+          <Badge tone="danger">读取异常</Badge>
         ) : isUnfetched ? (
           <Badge tone="neutral">未读取</Badge>
         ) : statusMeta ? (
@@ -352,10 +428,10 @@ function AccountRow(
         ) : null}
       </Row>
 
-      {/* 主额度区：未读取新号给出友好提示，其余分别处理未过期与已过重置窗口 */}
+      {/* 主额度区：未读取新号给出友好提示，其余分别处理活跃与已重置窗口 */}
       {isUnfetched && sessionPct === null && weeklyPct === null ? (
         <Text muted size="xs">
-          尚未读取额度，切入此账号后自动刷新
+          尚未读取额度，切换到此账号后自动更新
         </Text>
       ) : (
         <>
@@ -368,17 +444,11 @@ function AccountRow(
                 tone={sessionExpired ? 'neutral' : quotaTextTone(sessionPct)}
               >
                 {sessionExpired
-                  ? `${primaryPrefix}5h 已过重置`
+                  ? `${primaryPrefix}5h 已重置`
                   : `${primaryPrefix}5h ${sessionPct === null ? '—' : `${clampPercent(sessionPct)}%`}`}
               </Text>
               <Text muted size="xs">
-                {sessionExpired
-                  ? sessionPct !== null
-                    ? `上轮 ${clampPercent(sessionPct)}% · ${account.isActive ? '点刷新' : '切入刷新'}`
-                    : account.isActive
-                      ? '点刷新'
-                      : '切入刷新'
-                  : sessionReset}
+                {sessionExpired ? (account.isActive ? '待刷新' : '切换后更新') : sessionReset}
               </Text>
             </Row>
             <Progress
@@ -397,17 +467,11 @@ function AccountRow(
                 tone={weeklyExpired ? 'neutral' : quotaTextTone(weeklyPct)}
               >
                 {weeklyExpired
-                  ? `${primaryPrefix}周 已过重置`
+                  ? `${primaryPrefix}周 已重置`
                   : `${primaryPrefix}周 ${weeklyPct === null ? '—' : `${clampPercent(weeklyPct)}%`}`}
               </Text>
               <Text muted size="xs">
-                {weeklyExpired
-                  ? weeklyPct !== null
-                    ? `上轮 ${clampPercent(weeklyPct)}% · ${account.isActive ? '点刷新' : '切入刷新'}`
-                    : account.isActive
-                      ? '点刷新'
-                      : '切入刷新'
-                  : weeklyReset}
+                {weeklyExpired ? (account.isActive ? '待刷新' : '切换后更新') : weeklyReset}
               </Text>
             </Row>
             <Progress
@@ -419,7 +483,7 @@ function AccountRow(
         </>
       )}
 
-      {/* 副模型池（如 Claude/GPT）：每个有该池的账号均清晰展示，绝不因 0% 隐藏；有活跃用量时附紧凑重置倒计时 */}
+      {/* 副模型池（如 Claude/GPT）：清晰展示，有活跃用量时附紧凑重置倒计时 */}
       {extraPools.map((pool) => (
         <Stack key={pool.key} gap="none">
           <Row justify="between" align="center" gap="xs">
@@ -445,43 +509,41 @@ function AccountRow(
         </Stack>
       ))}
 
-      {/* 底部行：左（可选别名邮箱 + 快照龄），右（纯选中/取消选中目标，未读/异常号亦开放手动切入） */}
-      <Row justify="between" align="center" gap="xs">
-        <Text muted size="xs" truncate>
-          {footerLeft}
-        </Text>
-        {isCurrentAndAllClean ? (
-          <Text muted size="xs">
-            ✓ 已全同步
+      {/* 底部行：正常使用中的当前账号且无备注时自动收起，不堆砌「已全同步」噪音 */}
+      {showFooterRow ? (
+        <Row justify="between" align="center" gap="xs">
+          <Text muted size="xs" truncate>
+            {footerLeft}
           </Text>
-        ) : onlyExternalLeft ? (
-          <Button size="xs" variant="ghost" disabled>
-            请见终端页
-          </Button>
-        ) : (
-          <Button
-            size="xs"
-            variant={isDraftSelected ? 'solid' : 'outline'}
-            tone={isDraftSelected ? 'accent' : 'neutral'}
-            icon={isDraftSelected ? 'check' : undefined}
-            disabled={!canSelectAsTarget}
-            tooltip={
-              isDraftSelected
-                ? '点击取消选中，恢复为顶部「自动选最空闲号」模式'
-                : isErrorAccount
-                  ? '上次读取额度异常，仍可手动选为目标切入并重刷'
-                  : '先选为待切换目标，然后再点顶部闪电执行'
-            }
-            onPress={() => {
-              set(pendingSwitchAtom, null)
-              set(noticeInfoAtom, null)
-              set(selectedTargetIdAtom, isDraftSelected ? null : account.id)
-            }}
-          >
-            {isDraftSelected ? '已选中' : '选择'}
-          </Button>
-        )}
-      </Row>
+          {isCurrentAndAllClean ? null : onlyExternalLeft ? (
+            <Button size="xs" variant="ghost" disabled>
+              请见终端页
+            </Button>
+          ) : (
+            <Button
+              size="xs"
+              variant={isDraftSelected ? 'solid' : 'outline'}
+              tone={isDraftSelected ? 'accent' : 'neutral'}
+              icon={isDraftSelected ? 'check' : undefined}
+              disabled={!canSelectAsTarget}
+              tooltip={
+                isDraftSelected
+                  ? '取消选择，恢复为顶部「智能切换最佳账号」'
+                  : isErrorAccount
+                    ? '上次读取额度异常，仍可手动切换并刷新'
+                    : '选择此账号，再点击顶部闪电按钮切换'
+              }
+              onPress={() => {
+                set(pendingSwitchAtom, null)
+                set(noticeInfoAtom, null)
+                set(selectedTargetIdAtom, isDraftSelected ? null : account.id)
+              }}
+            >
+              {isDraftSelected ? '已选中' : '选择'}
+            </Button>
+          )}
+        </Row>
+      ) : null}
     </Box>
   )
 }
@@ -518,12 +580,12 @@ function TerminalRow(
             {term.workspaceName}
           </Text>
           <Badge tone={term.isOutdated ? 'danger' : st.tone}>
-            {term.isOutdated ? '旧号' : st.text}
+            {term.isOutdated ? '旧账号' : st.text}
           </Badge>
         </Row>
         <Text muted size="xs">
           {isManagedChatTerminal(term)
-            ? '独立凭据'
+            ? '独立账号'
             : term.authEmail
               ? shortEmail(term.authEmail)
               : '识别中'}
@@ -544,13 +606,13 @@ function TerminalRow(
         <Text muted size="xs">
           {term.processKind === 'acp'
             ? isManagedChatTerminal(term)
-              ? '托管引擎 · 不随面板切号'
+              ? 'Orca 内置独立账号 · 不随本面板切换'
               : term.isOutdated
-                ? '宿主共号 · 空闲切号由 Orca 释放'
-                : '宿主共号 · 不支持原地重连'
+                ? '共用系统账号 · 空闲时由 Orca 自动释放'
+                : '共用系统账号'
             : term.conversationId
               ? `${st.text} · ${term.conversationId.slice(0, 8)}`
-              : `${st.text} · 空白会话`}
+              : `${st.text} · 新会话`}
         </Text>
         <Row gap="xs">
           {term.terminalId ? (
@@ -576,8 +638,8 @@ function TerminalRow(
               disabled={locked}
               tooltip={
                 isBusyOrUnknown
-                  ? '该终端正在运行或状态未知；二次点击确认后立即原地续接重连'
-                  : '在原 Tab 原地重启并续接原对话'
+                  ? '该终端正在运行中，再次点击确认将立即中断并重连原对话'
+                  : '在当前终端无缝重启并继续原对话'
               }
               onPress={() => {
                 if (isBusyOrUnknown && !requireConfirm(restartConfirmId)) return
@@ -590,7 +652,7 @@ function TerminalRow(
                 )
               }}
             >
-              {isConfirmingRestart ? '确认强切' : isBusyOrUnknown ? '强切' : '换号'}
+              {isConfirmingRestart ? '确认切换' : isBusyOrUnknown ? '立即切换' : '切换账号'}
             </Button>
           ) : null}
 
@@ -601,7 +663,7 @@ function TerminalRow(
               tone="danger"
               icon="stop"
               disabled={locked}
-              tooltip="优雅终止该外部旧进程（需二次点击确认）"
+              tooltip="结束该外部旧终端进程（需点击两次确认）"
               onPress={() => {
                 if (!requireConfirm(killConfirmId)) return
                 void runAction(() =>
@@ -678,55 +740,45 @@ function SwitchConfirmBox(
 
   const title =
     confirm.mode === 'best'
-      ? `确认切到最空闲号 ${shortEmail(target.email)}？`
-      : confirm.mode === 'sync'
-        ? `确认同步旧终端到 ${shortEmail(target.email)}？`
-        : target.isActive
-          ? `确认同步到当前号 ${shortEmail(target.email)}？`
-          : `确认切换到 ${shortEmail(target.email)}？`
+      ? `确认切换到推荐账号 ${shortEmail(target.email)}？`
+      : confirm.mode === 'sync' || target.isActive
+        ? `确认更新旧账号终端到 ${shortEmail(target.email)}？`
+        : `确认切换到 ${shortEmail(target.email)}？`
 
   let impactText = ''
   if (isForceRisk) {
-    impactText = `⚠ 将立刻强行中断 ${impact.forcedBusyCount} 个干活中/未知终端并重启（共重启 ${impact.immediateCount} 个）。`
+    impactText = `⚠ 将立即中断并重启 ${impact.forcedBusyCount} 个运行中终端（共重启 ${impact.immediateCount} 个）。`
   } else if (impact.totalManagedCliCount === 0) {
-    impactText = `仅修改全局默认账号（当前 ${snap.terminals.length} 个运行中进程均无需重启）。`
+    impactText = `仅切换默认账号（当前 ${snap.terminals.length} 个运行中终端均无需重启）。`
   } else {
     const immPart =
-      impact.immediateCount > 0 ? `立即原地重启 ${impact.immediateCount} 个空闲终端` : '暂不立即打断终端'
+      impact.immediateCount > 0 ? `立即重启 ${impact.immediateCount} 个空闲终端` : '暂不打断正在运行的终端'
     const tailParts: string[] = []
     if (impact.queueCount > 0) {
-      tailParts.push(`${impact.queueCount} 个干活中将按「${policyDisplayName(snap.workingPolicy)}」排队等待`)
+      tailParts.push(`${impact.queueCount} 个运行中终端按「${policyDisplayName(snap.workingPolicy)}」处理`)
     }
     if (impact.skipCount > 0) {
-      tailParts.push(`${impact.skipCount} 个干活中按策略跳过`)
+      tailParts.push(`${impact.skipCount} 个运行中终端暂不切换`)
     }
-    impactText = `将修改全局账号；${[immPart, ...tailParts].join('，')}。`
+    impactText = `切换默认账号后，${[immPart, ...tailParts].join('，')}。`
   }
   if (impact.acpCount > 0) {
-    impactText += ` 另有 ${impact.acpCount} 个宿主原生 Chat 持旧号（空闲将由 Orca 释放，干活中待完成）。`
+    impactText += ` 另有 ${impact.acpCount} 个原生 Chat 对话仍用旧账号（空闲将自动释放，运行中待回复完成）。`
   }
   if (manualCliCount > 0) {
-    impactText += ` 另有 ${manualCliCount} 个外部/受限终端需手动处理。`
+    impactText += ` 另有 ${manualCliCount} 个外部或受限终端需手动处理。`
   }
   if (impact.managedChatCount > 0) {
-    impactText += `（${impact.managedChatCount} 个托管 Chat 使用独立账号，不随本次切换）`
+    impactText += `（${impact.managedChatCount} 个独立账号 Chat 不受本次切换影响）`
   }
 
   let targetQuotaSummary: string
   if (isUnfetched && sPct === null && wPct === null) {
-    targetQuotaSummary = `目标：${target.email}（尚未读取额度，切入后自动刷新）`
+    targetQuotaSummary = `目标：${target.email}（尚未读取额度，切换后自动更新）`
   } else {
-    const sPart = sessionExpired
-      ? sPct !== null
-        ? `已过重置·上轮${clampPercent(sPct)}%`
-        : '已过重置'
-      : sTxt
-    const wPart = weeklyExpired
-      ? wPct !== null
-        ? `已过重置·上轮${clampPercent(wPct)}%`
-        : '已过重置'
-      : wTxt
-    const ageSuffix = snapshotAge ? ` · ${snapshotAge}快照` : ''
+    const sPart = sessionExpired ? '已重置' : sTxt
+    const wPart = weeklyExpired ? '已重置' : wTxt
+    const ageSuffix = snapshotAge ? ` · ${snapshotAge}更新` : ''
     const poolPrefix = primary.name ? `${primary.name} ` : ''
     targetQuotaSummary = `目标：${target.email}（${poolPrefix}5h ${sPart} · 周 ${wPart}${ageSuffix}）${isFull5h ? ' ⚠ 5h已满' : ''}`
   }
@@ -751,7 +803,7 @@ function SwitchConfirmBox(
         ))}
         {confirm.mode === 'best' && (sessionExpired || weeklyExpired) ? (
           <Text size="xs" muted>
-            注：基于旧快照推算（原窗口已过重置），切入后将实时刷新该账号真实额度。
+            注：该账号上次记录的重置时间已过，切换后将刷新最新实时额度。
           </Text>
         ) : null}
         <Text size="xs" tone={isForceRisk ? 'danger' : undefined}>
@@ -759,7 +811,7 @@ function SwitchConfirmBox(
         </Text>
         {isErrorAccount ? (
           <Text size="xs" tone="danger">
-            {`⚠ 该账号上次读取额度异常（${target.status}），若确认登录正常可手动切入重刷。`}
+            {`⚠ 该账号上次读取额度异常（${target.status}），若确认登录正常可手动切换并重刷。`}
           </Text>
         ) : null}
         <Row justify="end" gap="xs">
@@ -796,7 +848,7 @@ function SwitchConfirmBox(
               })
             }}
           >
-            {isErrorAccount ? '仍要切入' : confirm.mode === 'sync' || target.isActive ? '确认同步' : '确认换号'}
+            {isErrorAccount ? '仍要切换' : confirm.mode === 'sync' || target.isActive ? '确认更新' : '确认切换'}
           </Button>
         </Row>
       </Stack>
@@ -810,6 +862,7 @@ export default function Panel() {
   const noticeInfo = read(noticeInfoAtom)
   const isRefreshing = read(refreshingAtom)
   const isPendingAction = read(pendingActionAtom)
+  const isUpdatingPlugin = read(updatingPluginAtom)
   const confirmKey = read(confirmKeyAtom)
   const selectedTargetId = read(selectedTargetIdAtom)
   const pendingSwitch = read(pendingSwitchAtom)
@@ -833,13 +886,13 @@ export default function Panel() {
             <Text size="xs">{actionError}</Text>
           </Callout>
         ) : (
-          <Skeleton shape="block" lines={4} label="正在扫描账号与终端..." />
+          <Skeleton shape="block" lines={4} label="正在加载账号与终端..." />
         )}
       </Stack>
     )
   }
 
-  const locked = snap.busy || isPendingAction
+  const locked = snap.busy || isPendingAction || isUpdatingPlugin
   const totalOutdated = snap.outdatedCount + snap.externalOutdatedCount + snap.acpOutdatedCount
   const orcaTerminals = snap.terminals.filter((t) => t.processKind === 'cli' && !t.isExternal)
   const acpChats = snap.terminals.filter((t) => t.processKind === 'acp')
@@ -855,12 +908,12 @@ export default function Panel() {
       if (draftTarget.isActive && snap.outdatedCount === 0 && !snap.drift) {
         const acpHint =
           snap.acpOutdatedCount > 0
-            ? `（另有 ${snap.acpOutdatedCount} 个宿主 Chat 仍持旧号，请见终端页）`
+            ? `（另有 ${snap.acpOutdatedCount} 个原生 Chat 对话仍用旧账号，请见终端页）`
             : ''
-        set(
-          noticeInfoAtom,
-          `当前号 ${shortEmail(draftTarget.email)} 已全部对齐，无需重复切换；请在下方选其他账号。${acpHint}`
-        )
+        set(noticeInfoAtom, {
+          title: '无需切换',
+          body: `当前账号 ${shortEmail(draftTarget.email)} 下的所有终端已是最新，无需切换；如需换号请在下方选择其他账号。${acpHint}`
+        })
         return
       }
       set(pendingSwitchAtom, {
@@ -872,18 +925,18 @@ export default function Panel() {
     }
     const best = pickBestAccount(snap.accounts, snap.updatedAt)
     if (!best) {
-      set(actionErrorAtom, '没有状态正常（ok）的可用 Antigravity 账号')
+      set(actionErrorAtom, '没有可用的正常 Antigravity 账号')
       return
     }
     if (best.isActive && snap.outdatedCount === 0 && !snap.drift) {
       const acpHint =
         snap.acpOutdatedCount > 0
-          ? `（另有 ${snap.acpOutdatedCount} 个宿主 Chat 仍持旧号，请见终端页）`
+          ? `（另有 ${snap.acpOutdatedCount} 个原生 Chat 对话仍用旧账号，请见终端页）`
           : ''
-      set(
-        noticeInfoAtom,
-        `当前 ${shortEmail(best.email)} 已是最空闲可用号且全部终端已对齐，无需切换。${acpHint}`
-      )
+      set(noticeInfoAtom, {
+        title: '无需切换',
+        body: `当前账号 ${shortEmail(best.email)} 已是余量最充足的最佳账号，无需切换。${acpHint}`
+      })
       return
     }
     set(pendingSwitchAtom, {
@@ -908,7 +961,7 @@ export default function Panel() {
     })
   }
 
-  // 当前账号置顶，其余按真实可用余量排序（过期窗口不被死缓存垫底，且实测 0% 优先于过期推算）
+  // 当前账号置顶，其余按真实可用余量排序（已重置窗口不被旧缓存垫底，且实测 0% 优先于过期推算）
   const orderedAccounts = [...snap.accounts].sort((a, b) => {
     if (a.isActive !== b.isActive) return a.isActive ? -1 : 1
     return compareAccountsByHeadroom(a, b, snap.updatedAt)
@@ -919,24 +972,22 @@ export default function Panel() {
 
   return (
     <Stack gap="md">
-      {/* 极简顶栏 */}
+      {/* 极简顶栏：正常状态不贴多余绿标，仅在切换中或有旧账号待处理时提示 */}
       <Row justify="between" align="center">
         <Row gap="xs" align="center">
           <Heading level={2}>反重力换号</Heading>
           {locked ? (
-            <Badge tone="accent">处理中</Badge>
+            <Badge tone="accent">切换中</Badge>
           ) : totalOutdated > 0 ? (
-            <Badge tone="warning">{`${totalOutdated} 旧号`}</Badge>
+            <Badge tone="warning">{`${totalOutdated} 个待切换`}</Badge>
           ) : snap.unknownAuthCount > 0 ? (
-            <Badge tone="warning">{`${snap.unknownAuthCount} 未知`}</Badge>
-          ) : (
-            <Badge tone="success">已对齐</Badge>
-          )}
+            <Badge tone="warning">{`${snap.unknownAuthCount} 个识别中`}</Badge>
+          ) : null}
         </Row>
         <IconButton
           icon="refresh"
           label="刷新账号额度与终端"
-          tooltip="立即拉取最新远程额度与本机 agy 进程"
+          tooltip="立即刷新账号额度与当前运行的终端状态"
           variant="ghost"
           size="xs"
           disabled={isRefreshing || locked}
@@ -950,18 +1001,58 @@ export default function Panel() {
         </Callout>
       ) : null}
 
+      {snap.updateInfo ? (
+        <Callout
+          tone="accent"
+          title={`发现新版本 v${snap.updateInfo.latestVersion}`}
+          icon="info"
+        >
+          <Stack gap="xs">
+            {snap.updateInfo.approvalCommand ? (
+              <>
+                <Text size="xs">此版本新增了权限，请在终端运行以下命令确认升级：</Text>
+                <Code block>{snap.updateInfo.approvalCommand}</Code>
+              </>
+            ) : snap.updateInfo.canOneClickUpdate ? (
+              <Row justify="between" align="center" gap="xs">
+                <Text size="xs">
+                  {`当前版本 v${snap.updateInfo.currentVersion}，点击即可自动升级。`}
+                </Text>
+                <Button
+                  size="xs"
+                  variant="solid"
+                  tone="accent"
+                  icon="refresh"
+                  disabled={locked}
+                  onPress={() => void applyPluginUpdate(snap.updateInfo!.latestVersion)}
+                >
+                  {isUpdatingPlugin ? '正在更新...' : '立即更新'}
+                </Button>
+              </Row>
+            ) : (
+              <Text size="xs">
+                {`当前为本地目录安装（v${snap.updateInfo.currentVersion}），拉取最新代码后点右上角刷新即可一键更新。`}
+              </Text>
+            )}
+          </Stack>
+        </Callout>
+      ) : null}
+
       {snap.scanDegradedReason ? (
-        <Callout tone="warning" title="扫描安全降级" icon="warning">
-          <Text size="xs">{snap.scanDegradedReason}，已暂停自动补切与队列清理。</Text>
+        <Callout tone="warning" title="状态检测受限" icon="warning">
+          <Text size="xs">{snap.scanDegradedReason}，已暂停自动切换以保护当前终端。</Text>
         </Callout>
       ) : null}
 
       {snap.drift ? (
-        <Callout tone="danger" title="账号已被旧进程顶回" icon="warning">
+        <Callout
+          tone="danger"
+          title={`账号被旧终端改回 ${shortEmail(snap.drift.actualEmail)}`}
+          icon="warning"
+        >
           <Stack gap="xs">
             <Text size="xs">
-              预期 {shortEmail(snap.drift.expectedEmail)}，当前漂移为{' '}
-              {shortEmail(snap.drift.actualEmail)}。
+              原账号为 {shortEmail(snap.drift.expectedEmail)}，后台旧终端刷新登录态时把默认账号改了回去。
             </Text>
             <Button
               size="xs"
@@ -970,19 +1061,19 @@ export default function Panel() {
               disabled={locked}
               onPress={openConfirmForSync}
             >
-              切回预期号并同步旧终端
+              {`切回 ${shortEmail(snap.drift.expectedEmail)}`}
             </Button>
           </Stack>
         </Callout>
       ) : null}
 
       {!snap.drift && totalOutdated > 0 ? (
-        <Callout tone="warning" title={`发现 ${totalOutdated} 个旧号进程`} icon="warning">
+        <Callout tone="warning" title={`有 ${totalOutdated} 个终端仍在使用旧账号`} icon="warning">
           <Stack gap="xs">
             <Text size="xs">
               {snap.outdatedCount > 0
-                ? '每小时刷 Token 时可能顶掉当前账号。'
-                : '宿主原生 Chat / 外部进程仍挂旧号，每小时刷 Token 时可能顶回旧号。'}
+                ? '后台刷新登录态时可能会把当前账号改回去。'
+                : '原生 Chat 或外部终端仍在使用旧账号，后台刷新时可能会改回旧账号。'}
             </Text>
             {snap.outdatedCount > 0 ? (
               <Button
@@ -992,7 +1083,7 @@ export default function Panel() {
                 disabled={locked}
                 onPress={openConfirmForSync}
               >
-                {`一键同步 ${snap.outdatedCount} 个旧终端到 ${shortEmail(snap.currentEmail)}`}
+                {`更新 ${snap.outdatedCount} 个终端到 ${shortEmail(snap.currentEmail)}`}
               </Button>
             ) : (
               <Button
@@ -1002,7 +1093,7 @@ export default function Panel() {
                 icon="terminal"
                 onPress={() => set(activeTabAtom, 'terminals')}
               >
-                查看旧号进程
+                查看详情
               </Button>
             )}
           </Stack>
@@ -1024,7 +1115,7 @@ export default function Panel() {
         </Callout>
       ) : null}
 
-      {/* 主控区：底部先选账号 -> 顶部闪电确认，或直接点自动选最空闲后确认，全链路防误触 */}
+      {/* 主控区：底部先选账号 -> 顶部闪电确认，或直接点击智能切换最佳账号 */}
       <Stack gap="xs">
         <Row gap="xs" wrap align="center">
           <Button
@@ -1035,22 +1126,22 @@ export default function Panel() {
             disabled={locked || snap.accounts.length === 0}
             tooltip={
               draftTarget
-                ? `点击先预览确认，再切换到 ${draftTarget.email}`
-                : '点击先预览当前最空闲账号与影响终端，确认后才执行'
+                ? `先预览切换影响，确认后切换到 ${draftTarget.email}`
+                : '先预览推荐的最佳账号与受影响终端，确认后才执行'
             }
             onPress={openConfirmForPrimary}
           >
             {draftTarget
               ? draftTarget.isActive
-                ? `同步到 ${shortEmail(draftTarget.email)}`
-                : `切到 ${shortEmail(draftTarget.email)} 并同步`
-              : '自动切最空闲号并同步'}
+                ? `更新终端到 ${shortEmail(draftTarget.email)}`
+                : `切换到 ${shortEmail(draftTarget.email)}`
+              : '智能切换最佳账号'}
           </Button>
           {draftTarget ? (
             <IconButton
               icon="close"
               label="取消选中的账号"
-              tooltip="取消下方账号选择，恢复为自动选最空闲模式"
+              tooltip="取消选择，恢复为智能推荐最佳账号"
               variant="ghost"
               size="xs"
               disabled={locked}
@@ -1068,7 +1159,7 @@ export default function Panel() {
                 tone={isConfirmingDrain ? 'danger' : 'warning'}
                 icon="play"
                 disabled={locked}
-                tooltip="若排队终端因 429 限流卡在 working，二次点击立刻强制原地重连"
+                tooltip="若等待中的终端因限流卡住，再次点击确认将立即中断并重连"
                 onPress={() => {
                   if (!requireConfirm('forceDrainQueue')) return
                   void runAction(() =>
@@ -1080,8 +1171,8 @@ export default function Panel() {
                 }}
               >
                 {isConfirmingDrain
-                  ? `再点确认强切 (${snap.queuedCount})`
-                  : `强制立切排队 (${snap.queuedCount})`}
+                  ? `再点确认切换 (${snap.queuedCount})`
+                  : `立即切换等待项 (${snap.queuedCount})`}
               </Button>
               <Button
                 size="sm"
@@ -1098,21 +1189,21 @@ export default function Panel() {
                   )
                 }
               >
-                清空排队
+                取消等待
               </Button>
             </>
           ) : null}
         </Row>
 
         <Select
-          label="遇到正在干活的终端策略"
+          label="运行中终端处理方式"
           labelHidden
           value={snap.workingPolicy}
           disabled={locked}
           options={[
-            { value: 'queue', label: '干活中策略：等空闲自动换号（推荐）' },
-            { value: 'skip', label: '干活中策略：跳过不动' },
-            { value: 'force', label: '干活中策略：立刻中断强切' }
+            { value: 'queue', label: '运行中终端：回复完自动切换（推荐）' },
+            { value: 'skip', label: '运行中终端：暂不切换' },
+            { value: 'force', label: '运行中终端：立即中断并切换' }
           ]}
           onChange={(val) => {
             const policy = val as WorkingPolicy
@@ -1131,9 +1222,9 @@ export default function Panel() {
       {pendingSwitch ? SwitchConfirmBox(pendingSwitch, snap, locked) : null}
 
       {!pendingSwitch && noticeInfo ? (
-        <Callout tone="accent" title="无需切换" icon="info">
+        <Callout tone="accent" title={noticeInfo.title} icon="info">
           <Row justify="between" align="center" gap="xs">
-            <Text size="xs">{noticeInfo}</Text>
+            <Text size="xs">{noticeInfo.body}</Text>
             <Button size="xs" variant="ghost" onPress={() => set(noticeInfoAtom, null)}>
               知道了
             </Button>
@@ -1172,7 +1263,7 @@ export default function Panel() {
         </Card>
       ) : null}
 
-      {/* 分栏视图：告别长瀑布堆砌 */}
+      {/* 分栏视图 */}
       <Tabs
         label="视图切换"
         value={activeTab}
@@ -1192,7 +1283,7 @@ export default function Panel() {
             {activeUsageAt ? (
               <Row justify="end">
                 <Text muted size="xs">
-                  当前号额度更新于 <RelativeTime at={activeUsageAt} />
+                  额度更新于 <RelativeTime at={activeUsageAt} />
                 </Text>
               </Row>
             ) : null}
@@ -1204,11 +1295,11 @@ export default function Panel() {
             {snap.terminals.length === 0 ? (
               <EmptyState
                 icon="terminal"
-                title="当前没有运行中的 agy 终端或原生 Chat"
+                title="当前没有运行中的 agy 终端或对话"
                 description={
                   snap.chatBackendMode === 'orca-managed'
-                    ? '新打开的 agy 终端会使用当前选中账号（注：Orca 托管原生 Chat 使用独立凭据）。'
-                    : '新打开的 agy 终端或宿主原生 Chat 会自动使用当前选中的账号。'
+                    ? '新打开的 agy 终端将自动使用当前账号（注：Orca 内置独立账号 Chat 不受影响）。'
+                    : '新打开的 agy 终端或对话将自动使用当前账号。'
                 }
               />
             ) : (
@@ -1231,10 +1322,10 @@ export default function Panel() {
                     </Text>
                     <Text muted size="xs">
                       {acpChats.every((c) => isManagedChatTerminal(c))
-                        ? '托管引擎使用独立账号，不随面板切号；请勿强杀，无需干预。'
+                        ? '使用 Orca 独立内置账号，不受本面板换号影响，无需操作。'
                         : acpChats.some((c) => isManagedChatTerminal(c))
-                          ? '托管 Chat 使用独立账号；宿主 Chat 与终端共号，空闲者切号时由 Orca 释放。'
-                          : '宿主模式与终端共号；切号时 Orca 将自动释放空闲 Chat，干活中需等待完成或重开。'}
+                          ? '独立账号对话不受影响；共用系统账号的空闲对话将在换号时自动释放。'
+                          : '与终端共用系统账号；换号时自动释放空闲对话，正在回复中的对话请等完成或重开。'}
                     </Text>
                     {acpChats.map((t) => TerminalRow(t, snap, locked, confirmKey))}
                   </Stack>

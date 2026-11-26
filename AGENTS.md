@@ -1,7 +1,7 @@
 # 086_Orca反重力账号切换 — 项目协作与红线文档
 
 > 本仓为 Orca 插件根目录，Orca 安全校验硬性禁止目录或 Git 树包含任何 symlink（会报 `symlink not allowed in plugin content`），因此本仓**不建 `CLAUDE.md` 软链**，仅以本 `AGENTS.md` 为唯一指令真源。
-> 当前稳定运行版本：**`v0.2.8`**（插件 ID：`local.agy-account-switcher`，最后对齐日期：`2026-11-24`）。
+> 当前稳定运行版本：**`v0.2.9`**（插件 ID：`local.agy-account-switcher`，最后对齐日期：`2026-11-26`）。
 
 ## 项目定位与结构
 
@@ -10,16 +10,16 @@
 | 文件 | 职责 |
 |---|---|
 | `orca-plugin.json` | Manifest v2 清单：声明 6 项最小权限、面板 `switcher`、状态栏 `agy-account-status`、5 条命令、2 个事件订阅、5 项设置 |
-| `src/protocol.ts` | Worker 与 Panel 共享强类型通信协议（`SwitcherSnapshot`、`AccountBucketGroup`、`usageUpdatedAt`、`ChatEngine`、`PluginRequests`） |
-| `src/command-builder.ts` | 纯函数模块：邮箱规范化、命令分类（含托管 `agy_acp_server` 识别与后台 `acp` 探活去噪 `shouldIgnoreUnstructuredAcpProbe`）、白名单重启命令重构、跨池额度单源隔离解析（`resolveAccountQuotaPools`/`resolvePrimaryQuota`）、窗口过期判定与单号快照龄（`isQuotaWindowExpired`、`formatSnapshotAge`、`formatResetCountdown`）、异时余量比较/最空闲账号选择（`compareAccountsByHeadroom`、`pickBestAccount`）、状态栏计算与切换影响评估（`computeSwitchImpact`） |
-| `src/system.ts` | macOS 本机与 Orca CLI 适配层：`orca account/terminal/agent` 调用（含分池 `parseAccountBuckets`、透传 `usage.updatedAt`、拆出未读新号 `unfetched`、保留 `orcaSessionId` 与 `chatUsesAgy`）、`/bin/ps`（解析 `ORCA_AGENT_SESSION_ID`/`ORCA_STRUCTURED_SESSION`/`GEMINI_HOME`）与 `/usr/sbin/lsof` 扫描、PID 复用校验、Shell 前台进程组检测 |
-| `src/switcher.ts` | 核心换号服务：单次同步互斥锁、`executeSwitchAllLocked` 4 步状态机、失败自动回滚、队列指数退避重试、快慢双通道轮询、`ORCA_AGENT_SESSION_ID === orcaSessionId` 原生 Chat 1-on-1 精确绑定 |
-| `src/worker.ts` | Worker 入口：递归 `setTimeout` + `pollGeneration` 防双定时器、事件防抖与统一 `Disposable` 清理 |
-| `src/panel.tsx` | 原生 Components 面板：先选账号再点闪电、全量操作影响预览二次确认、Tabs 分栏（「账号 / 终端」）、按分池精确展示 `Gemini` 与 `Claude/GPT` 额度及重置倒计时（杜绝顶层跨池汇总串值）、每卡独立快照龄、过期窗口去假红警与 `unfetched`/异常号手动切入解死锁 |
-| `src/panel.check.ts` | `orca plugin check` 的 3 套预览场景（`synced`（含跨池差异、过期快照与时效）/ `outdatedAlert`（含原生 Chat 演示）/ `driftAlert`） |
-| `src/worker.test.ts` | Worker 核心状态机、红队攻防、跨模型池隔离、异时快照选号、状态栏只读防误触与多原生 Chat/托管隔离单元测试（18 项） |
-| `src/panel.test.tsx` | 面板选号、确认框、防误触、恢复命令、过期去红警、未读新号解死锁与跨模型池隔离交互测试（4 项） |
-| `src/node-shims.d.ts` | 轻量 Node 内置模块类型垫片（供无 `@types/node` 环境下严格 `tsc --noEmit` 通过） |
+| `src/protocol.ts` | Worker 与 Panel 共享强类型通信协议（`SwitcherSnapshot`、`AccountBucketGroup`、`PluginUpdateInfo`、`ApplyUpdateOutput`、`PluginRequests` 含 `switcher.applyUpdate`） |
+| `src/command-builder.ts` | 纯函数模块：邮箱规范化、命令分类（含托管 `agy_acp_server` 识别与后台 `acp` 探活去噪 `shouldIgnoreUnstructuredAcpProbe`）、白名单重启命令重构、跨池额度单源隔离解析（`resolveAccountQuotaPools`/`resolvePrimaryQuota`）、窗口重置判定与单号时效（`isQuotaWindowExpired` 排除 `resetsAt<=0`、`formatSnapshotAge`、`formatResetCountdown`）、异时余量比较/最佳账号选择（`compareAccountsByHeadroom`、`pickBestAccount`）、SemVer/Tag 解析与授权命令提取（`parseSemver`、`compareSemver`、`extractLatestTagVersion`、`extractApproveCommand`）、状态栏计算与切换影响评估 |
+| `src/system.ts` | macOS 本机与 Orca CLI 适配层：`orca account/terminal/agent/plugin` 调用（含分池 `parseAccountBuckets` 过滤 `resetsAt<=0`、透传 `usage.updatedAt`、未读新号 `unfetched`、已安装插件元数据 `getSelfPluginMeta`、远程正式版 Tag 检测 `fetchLatestRemoteVersion`、`detached` 独立进程组自更新 `runPluginUpdate`）、`/bin/ps` 与 `/usr/sbin/lsof` 扫描、PID 复用校验、Shell 前台进程组检测 |
+| `src/switcher.ts` | 核心换号与更新服务：单次同步互斥锁、`executeSwitchAllLocked` 4 步状态机、失败自动回滚、队列指数退避重试、快慢双通道轮询、`ORCA_AGENT_SESSION_ID === orcaSessionId` 原生 Chat 1-on-1 精确绑定、低频新版本检测与单版本通知去重（`checkForPluginUpdate`/`applyPluginUpdate`） |
+| `src/worker.ts` | Worker 入口：递归 `setTimeout` + `pollGeneration` 防双定时器、延迟启动新版本检查、事件防抖与统一 `Disposable` 清理 |
+| `src/panel.tsx` | 原生 Components 面板：直观产品文案（「智能切换最佳账号」、「切换到 xxx」、「运行中终端：回复完自动切换（推荐）」）、新版本一键升级横幅（含 Worker 热重启 IPC 断开自动复核与新权限命令兜底）、全量操作影响预览二次确认、Tabs 分栏（「账号 / 终端」）、`Gemini` 与 `Claude/GPT` 独立分池可视化 |
+| `src/panel.check.ts` | `orca plugin check` 的 3 套预览场景（`synced` / `outdatedAlert`（含原生 Chat 与新版本升级横幅演示）/ `driftAlert`） |
+| `src/worker.test.ts` | Worker 核心状态机、红队攻防、跨模型池隔离、`resetsAt=0` 空闲池保护、新版本检测/去重/一键升级与多原生 Chat 单元测试（19 项） |
+| `src/panel.test.tsx` | 面板选号、确认框、防误触、恢复命令、已重置与 `0%` 空闲池展示、未读/异常号解死锁、跨池隔离及一键升级横幅交互测试（5 项） |
+| `src/node-shims.d.ts` | 轻量 Node 内置模块类型垫片（含 `fs/promises` `readFile` 与 `child_process` `spawn`，供无 `@types/node` 环境下严格 `tsc --noEmit` 通过） |
 
 ## 架构红线与实测踩坑
 
@@ -38,7 +38,9 @@
    - 账号列表卡片仅提供零风险「选择/取消选中」状态；顶部闪电主按钮与预警/漂移条按钮点击后一律先弹出影响预览确认卡片（由 `computeSwitchImpact` 与后端过滤口径保持 100% 一致），用户显式确认后才发出切换请求。
    - 面板对每个账号完整展示所有模型池（`Gemini` 5h/周进度条 + `Claude/GPT` 5h/周汇总及活跃窗口重置倒计时），不得因 `0%` 隐藏副池。
    - **跨模型池单源隔离红线**：Orca 顶层 `usage.session` / `usage.weekly` 为跨所有池子取最大占用率的汇总值（如 Gemini 周 28%、Claude/GPT 周 93% 时顶层为 93%）。面板卡片、切换确认框、排序选号（`compareAccountsByHeadroom`/`pickBestAccount`）、状态栏（`computeStatusBar`）与快捷同步（`quickSyncCommand`）必须一律通过 `resolveAccountQuotaPools` / `resolvePrimaryQuota` 优先读取独立分池（`buckets`），严禁将顶层跨池汇总直接贴上 `Gemini` 标签或用于主池判满。
-   - **多账号异时快照诚实展示与未读新号不锁死**：必须保留每账号独立的 `usage.updatedAt`（底栏标注“当前号额度更新于”）；主/副池、确认框与状态栏统一按 `isQuotaWindowExpired` 去假红警（标明“已过重置/上轮 X%”而不伪造实测 `0%`）；新添加未读账号（`usage == null`）映射为 `unfetched`，与历史异常号均开放手动点选切入刷新，而 `pickBestAccount` 仍严格仅选 `status === 'ok'` 且实测 `0%` 优先于过期推算。
+   - **多账号异时快照诚实展示、未开窗 `resetsAt=0` 保护与未读新号不锁死**：必须保留每账号独立的 `usage.updatedAt`（底栏标注“额度更新于”）；底层对未启用计时的 `0%` 空闲池返回 `resetsAt: 0`，`parseAccountBuckets` 与 `isQuotaWindowExpired` 必须严格校验 `resetsAt > 0`，确保满血未用池正常显示 `0%`；真已过期的旧快照（`0 < resetsAt <= nowMs`）标明“已重置（切换后更新）”去假红警；新添加未读账号（`usage == null`）映射为 `unfetched`，与历史异常号均开放手动点选切换刷新，而 `pickBestAccount` 仍严格仅选 `status === 'ok'` 且实测 `0%` 优先于过期推算。
+   - **用户视角自然文案**：面板文案统一采用直观产品用语（如「智能切换最佳账号」、「切换到 xxx」、「运行中终端：回复完自动切换（推荐）」、「已重置」），禁止堆砌「最空闲号」、「干活中策略」、「已过重置」、「已全同步」、「已对齐」等内部调试黑话。
+   - **新版本检测与一键点击升级**：Worker 低频（启动延迟 3s + 每 4h + 手动刷新 5m 冷却）通过 `git ls-remote --tags` 非阻塞检测远端正式版 Tag（过滤 `-beta`/`-rc`），同一新版本仅弹 1 次桌面通知并在面板顶部展示「立即更新」按钮；点击后通过独立进程组（`detached: true`）调用 `orca plugin update <pluginKey> --json`，常规同权限更新免 `--approve` 直接热升级，若未来大版本新增权限返回 `approval_required` 则原样展示确认命令代码块，严禁绕过 Orca 权限审批。
    - **底部状态栏只读防误触**：底部状态栏 `agy-account-status` 必须保持纯只读展示（严禁在 `statusBarItems` 上绑定会触发换号或同步的 `command`），且 tooltip 须明确标明“反重力 (AGY)”身份并引导用户至右侧「反重力换号」面板操作，杜绝用户误点直接触发副作用。
 5. **插件安装、热更新与禁止 symlink**：
    - **严禁在插件目录或 Git 树内放置任何 symlink（如 `CLAUDE.md -> AGENTS.md`）或 Git submodule**，否则 `orca plugin inspect` / `install` / `release-entry` 会直接拒绝（`symlink not allowed in plugin content`），`validate` 默认不拦截此项，必须同时用 `inspect` 验证！
@@ -52,10 +54,10 @@
 每次修改代码、清单或文档后按顺序执行：
 
 ```bash
-# 1. 类型检查（须 0 error）
-npx tsc --noEmit
+# 1. 类型检查（须 0 error；禁止裸跑 `npx tsc`，否则 npm 会误拉废弃的 tsc@2.0.4 包）
+tsc --noEmit || npx --yes --package=typescript tsc --noEmit
 
-# 2. Orca 插件校验 + 打包/可分发检查 + 单测 + 3 场景预览（须全绿且 0 warning）
+# 2. Orca 插件校验 + 打包/可分发检查 + 单测（24 项）+ 3 场景预览（须全绿且 0 warning）
 orca plugin validate . --json
 orca plugin inspect . --json
 orca plugin release-entry . --json   # 针对已提交 HEAD 验证可作为 Git/Catalog 发布

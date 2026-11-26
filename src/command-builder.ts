@@ -357,16 +357,81 @@ export function shortEmail(email: string | null | undefined): string {
   return idx > 0 ? email.slice(0, idx) : email
 }
 
+/** 解析正式版 `vX.Y.Z` / `X.Y.Z` 为三元数字组；预发布后缀（如 `-beta.1`）返回 null，避免向稳定版用户推送测试版。 */
+export function parseSemver(version: string | null | undefined): [number, number, number] | null {
+  if (!version) return null
+  const m = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)$/)
+  if (!m) return null
+  const major = Number.parseInt(m[1]!, 10)
+  const minor = Number.parseInt(m[2]!, 10)
+  const patch = Number.parseInt(m[3]!, 10)
+  if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(patch)) return null
+  return [major, minor, patch]
+}
+
+/** 比较两个正式版语义化版本号：a > b 返回正数，a < b 返回负数，相等或无法解析时按规则返回 0。 */
+export function compareSemver(a: string | null | undefined, b: string | null | undefined): number {
+  const pa = parseSemver(a)
+  const pb = parseSemver(b)
+  if (!pa || !pb) return 0
+  if (pa[0] !== pb[0]) return pa[0] - pb[0]
+  if (pa[1] !== pb[1]) return pa[1] - pb[1]
+  return pa[2] - pb[2]
+}
+
+/** 从 `git ls-remote --tags --refs` 输出中提取最大的正式版版本号（不含前导 `v`）。 */
+export function extractLatestTagVersion(lsRemoteStdout: string): string | null {
+  let latest: string | null = null
+  for (const rawLine of lsRemoteStdout.split('\n')) {
+    const m = rawLine.trim().match(/refs\/tags\/v?(\d+\.\d+\.\d+)$/)
+    if (!m?.[1]) continue
+    const candidate = m[1]
+    if (!parseSemver(candidate)) continue
+    if (latest === null || compareSemver(candidate, latest) > 0) {
+      latest = candidate
+    }
+  }
+  return latest
+}
+
+/** 从 `orca plugin update` 错误信息或指纹字段中安全提取需要用户确认的 `--approve` 命令。 */
+export function extractApproveCommand(
+  rawText: string,
+  pluginKey: string,
+  fingerprint?: string | null
+): string | null {
+  const cmdMatch = rawText.match(/orca\s+plugin\s+(?:update|install)\s+[^\r\n`"'<>]*--approve\s+\S+/)
+  if (cmdMatch?.[0]) {
+    return cmdMatch[0].trim()
+  }
+  const fp =
+    fingerprint?.trim() ||
+    rawText.match(/--approve\s+(sha256-[A-Za-z0-9+/=_-]+|ap\d+-[A-Za-z0-9+/=_-]+)/)?.[1] ||
+    null
+  if (fp) {
+    return `orca plugin update ${shellQuote(pluginKey)} --approve ${shellQuote(fp)}`
+  }
+  return null
+}
+
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n)
 }
 
-/** 判断单个额度窗口的重置时间点是否已经过期（resetsAt <= nowMs）。 */
+/**
+ * 判断单个额度窗口的重置时间点是否已经过去（resetsAt > 0 && resetsAt <= nowMs）。
+ * 注意：底层对尚未开启滚动计时的 0% 空闲池返回 `resetsAt: 0`，属于未启用占位值而非过期窗口。
+ */
 export function isQuotaWindowExpired(
   resetsAt: number | null | undefined,
   nowMs: number
 ): boolean {
-  return typeof resetsAt === 'number' && Number.isFinite(resetsAt) && resetsAt <= nowMs
+  return (
+    typeof resetsAt === 'number' &&
+    Number.isFinite(resetsAt) &&
+    resetsAt > 0 &&
+    resetsAt <= nowMs
+  )
 }
 
 /** 格式化快照实际观测时刻距今时长（缺失返回 null）。 */
@@ -384,7 +449,8 @@ export function formatSnapshotAge(
 
 /**
  * 精确到分钟格式化重置倒计时与目标时刻：
- * - 已过期（resetsAt <= now）返回「窗口已过 · 切入刷新」或当前号「窗口已过 · 点刷新」，消除「已可重置」的手动操作歧义；
+ * - 未开启计时窗口（null / <= 0）返回 `—`；
+ * - 已到重置时间（0 < resetsAt <= now）返回「切换后更新」或当前号「待刷新」；
  * - 5h 窗口（< 24 小时）：如 `3时02分 · 01:36`、`42分钟 · 23:16`；
  * - 周窗口（>= 24 小时）：如 `5天18时14分 · 11/28`；
  * - mode='short' 用于窄卡片右对齐，`mode='full'` 用于状态栏 tooltip。
@@ -395,13 +461,13 @@ export function formatResetCountdown(
   mode: 'short' | 'full' = 'short',
   options?: { isActive?: boolean }
 ): string {
-  if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt)) return '—'
+  if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt) || resetsAt <= 0) return '—'
   const diffMs = resetsAt - nowMs
   if (diffMs <= 0) {
     if (options?.isActive) {
-      return mode === 'full' ? '窗口已过，待刷新' : '窗口已过 · 点刷新'
+      return mode === 'full' ? '已重置，待刷新' : '待刷新'
     }
-    return mode === 'full' ? '窗口已过，切入后刷新' : '窗口已过 · 切入刷新'
+    return mode === 'full' ? '已重置，切换后更新' : '切换后更新'
   }
 
   const totalMins = Math.ceil(diffMs / 60_000)
@@ -708,8 +774,8 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
   }
 
   if (snapshot.busy) {
-    return formatStatusResult(snapshot.busyLabel || 'AGY 正在换号...', 'accent', [
-      '反重力 (AGY) 正在执行全终端无损换号...'
+    return formatStatusResult(snapshot.busyLabel || 'AGY 切换中...', 'accent', [
+      '反重力 (AGY) 正在切换账号并更新终端...'
     ])
   }
 
@@ -738,13 +804,17 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
   })
   const poolPrefix = primary?.name && secondary.length > 0 ? `${primary.name} ` : ''
   const sessionDetail = activeSessionExpired
-    ? `${poolPrefix}5h 已过重置${typeof used === 'number' ? `·上轮${used}%` : ''}（待刷新）`
-    : `${poolPrefix}5h ${usedLabel}（${sessionResetStr}）`
+    ? `${poolPrefix}5h 已重置（待刷新）`
+    : sessionResetStr !== '—'
+      ? `${poolPrefix}5h ${usedLabel}（${sessionResetStr}）`
+      : `${poolPrefix}5h ${usedLabel}`
   const weeklyPctStr =
     typeof primary?.weeklyUsedPercent === 'number' ? `${primary.weeklyUsedPercent}%` : '?'
   const weeklyDetail = activeWeeklyExpired
-    ? `周 已过重置${typeof primary?.weeklyUsedPercent === 'number' ? `·上轮${primary.weeklyUsedPercent}%` : ''}（待刷新）`
-    : `周 ${weeklyPctStr}（${weeklyResetStr}）`
+    ? '周 已重置（待刷新）'
+    : weeklyResetStr !== '—'
+      ? `周 ${weeklyPctStr}（${weeklyResetStr}）`
+      : `周 ${weeklyPctStr}`
   const secondarySummaryLines: string[] = []
   for (const pool of secondary) {
     const sExp = isQuotaWindowExpired(pool.sessionResetsAt, snapshot.updatedAt)
@@ -753,12 +823,12 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
     const wActive = !wExp && typeof pool.weeklyUsedPercent === 'number' && pool.weeklyUsedPercent > 0
     if (!sActive && !wActive) continue
     const sTxt = sExp
-      ? '已过重置'
+      ? '已重置'
       : typeof pool.sessionUsedPercent === 'number'
         ? `${pool.sessionUsedPercent}%`
         : '—'
     const wTxt = wExp
-      ? '已过重置'
+      ? '已重置'
       : typeof pool.weeklyUsedPercent === 'number'
         ? `${pool.weeklyUsedPercent}%`
         : '—'
@@ -767,8 +837,8 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
   const managedChatsCount = snapshot.terminals.filter((t) => isManagedChatTerminal(t)).length
   const procSummary =
     managedChatsCount > 0
-      ? `运行中：${snapshot.terminals.length} 进程（含 ${managedChatsCount} 托管Chat）`
-      : `运行中：${snapshot.terminals.length} 进程`
+      ? `运行中：${snapshot.terminals.length} 个终端（含 ${managedChatsCount} 个独立Chat）`
+      : `运行中：${snapshot.terminals.length} 个终端`
 
   const tooltipLines: string[] = [
     `反重力 (AGY) 当前账号：${active?.email ?? snapshot.currentEmail ?? '未知'}`,
@@ -783,10 +853,10 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
 
   if (snapshot.drift) {
     tooltipLines.push(
-      `⚠️ 漂移：预期 ${shortEmail(snapshot.drift.expectedEmail)} -> 实际 ${shortEmail(snapshot.drift.actualEmail)}`,
-      '请打开右侧「反重力换号」面板确认并拉齐'
+      `⚠️ 账号被旧终端改回 ${shortEmail(snapshot.drift.actualEmail)}（原为 ${shortEmail(snapshot.drift.expectedEmail)}）`,
+      '请打开右侧「反重力换号」面板切回原账号'
     )
-    return formatStatusResult(`AGY:${name} ⚠漂移`, 'danger', tooltipLines)
+    return formatStatusResult(`AGY:${name} ⚠账号被改回`, 'danger', tooltipLines)
   }
 
   const totalOutdated =
@@ -796,20 +866,20 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
       .filter((t) => t.isOutdated)
       .slice(0, 3)
       .map((t) => `• ${t.workspaceName} (${shortEmail(t.authEmail)})`)
-    tooltipLines.push(`⚠️ ${totalOutdated} 个旧号进程（可能顶号）：`, ...outdatedNames)
+    tooltipLines.push(`⚠️ ${totalOutdated} 个终端仍用旧账号：`, ...outdatedNames)
     if (snapshot.queuedCount > 0) {
-      tooltipLines.push(`⏳ ${snapshot.queuedCount} 个干活中，空闲自动切换`)
+      tooltipLines.push(`⏳ ${snapshot.queuedCount} 个运行中，回复完成后自动切换`)
     }
     tooltipLines.push('请打开右侧「反重力换号」面板处理')
-    return formatStatusResult(`AGY:${name} · ${totalOutdated}旧号`, 'warning', tooltipLines)
+    return formatStatusResult(`AGY:${name} · ${totalOutdated}待切换`, 'warning', tooltipLines)
   }
 
   if (snapshot.unknownAuthCount > 0) {
-    tooltipLines.push(`ℹ️ ${snapshot.unknownAuthCount} 个进程邮箱识别中`)
+    tooltipLines.push(`ℹ️ ${snapshot.unknownAuthCount} 个终端账号识别中`)
   }
 
   if (activeSessionExpired) {
-    tooltipLines.push('5h 窗口已过重置，可在右侧「反重力换号」面板刷新')
+    tooltipLines.push('5h 额度已重置，可在右侧「反重力换号」面板刷新')
     return formatStatusResult(`AGY:${name} 待刷新`, 'neutral', tooltipLines)
   }
 
@@ -823,7 +893,7 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
     return formatStatusResult(`AGY:${name} ${usedLabel}`, 'warning', tooltipLines)
   }
 
-  tooltipLines.push('已识别进程账号一致 ✓（仅展示，换号请打开右侧「反重力换号」面板）')
+  tooltipLines.push('所有终端账号一致 ✓（换号请打开右侧「反重力换号」面板）')
   return formatStatusResult(`AGY:${name} ${usedLabel}`, 'neutral', tooltipLines)
 }
 

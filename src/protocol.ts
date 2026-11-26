@@ -72,6 +72,24 @@ export interface RecoveryCommandItem {
   reason: string
 }
 
+export interface PluginUpdateInfo {
+  currentVersion: string
+  latestVersion: string
+  pluginKey: string
+  sourceKind: string
+  /** 是否可直接点击按钮一键升级（GitHub/Catalog 安装，或本地源码目录已拉取新版本）。 */
+  canOneClickUpdate: boolean
+  /** 若新版本增加了权限需要用户确认，展示此完整授权命令。 */
+  approvalCommand?: string | null
+}
+
+export interface ApplyUpdateOutput {
+  status: 'updated' | 'approval_required' | 'failed'
+  newVersion?: string | null
+  message: string
+  approvalCommand?: string | null
+}
+
 export interface OperationSummary {
   at: number
   targetEmail: string
@@ -108,6 +126,8 @@ export interface SwitcherSnapshot {
   scanDegradedReason: string | null
   lastOperation: OperationSummary | null
   error: string | null
+  pluginVersion?: string
+  updateInfo?: PluginUpdateInfo | null
   isPreview?: boolean
 }
 
@@ -191,6 +211,9 @@ declare module 'orca' {
     'switcher.setPolicy': {
       input: SetPolicyInput
       output: SwitcherSnapshot
+    }
+    'switcher.applyUpdate': {
+      output: ApplyUpdateOutput
     }
   }
 

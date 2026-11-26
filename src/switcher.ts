@@ -7,6 +7,7 @@ import { basename } from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
   buildRestartCommand,
+  compareSemver,
   computeStatusBar,
   emailsEqual,
   isManagedChatTerminal,
@@ -18,10 +19,12 @@ import {
 import type {
   AccountInfo,
   AgyTerminalInfo,
+  ApplyUpdateOutput,
   ChatBackendMode,
   ChatEngine,
   DriftWarning,
   OperationSummary,
+  PluginUpdateInfo,
   RecoveryCommandItem,
   SwitcherSnapshot,
   TerminalAgentState,
@@ -31,10 +34,14 @@ import type { RawAccountState, RawOrcaAgent, SystemAdapter } from './system'
 
 const STORAGE_DESIRED_ACCOUNT = 'desiredAccount'
 const STORAGE_PENDING_QUEUE = 'pendingQueue'
+const STORAGE_NOTIFIED_UPDATE_VERSION = 'notifiedUpdateVersion'
 const STORAGE_PREVIEW_SNAPSHOT = '__previewSnapshot'
 const MAX_QUEUE_ATTEMPTS = 3
 const MAX_QUEUE_AGE_MS = 24 * 60 * 60 * 1000
 const RETRY_BACKOFF_MS = [30_000, 60_000, 120_000]
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000
+const MANUAL_UPDATE_CHECK_COOLDOWN_MS = 5 * 60 * 1000
+const FALLBACK_PLUGIN_VERSION = '0.2.9'
 
 interface StoredDesiredAccount {
   id: string
@@ -163,9 +170,14 @@ export class SwitcherService {
   private lastOperation: OperationSummary | null = null
   private lastDriftNotifiedKey: string | null = null
   private lastPublishedDigest: string | null = null
+  private cachedPluginVersion = FALLBACK_PLUGIN_VERSION
+  private cachedUpdateInfo: PluginUpdateInfo | null = null
+  private lastUpdateCheckAt = 0
+  private inFlightUpdateCheck: Promise<void> | null = null
   private disposed = false
   private drainTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private postRestartTimer: ReturnType<typeof setTimeout> | null = null
+  private initialUpdateTimer: ReturnType<typeof setTimeout> | null = null
   /** 完整命令行与父 PID 仅保留在 Worker 内存，避免超大载荷击穿 panels.post 256 KiB 上限。 */
   private runtimeProcessMeta = new Map<number, { command: string; ppid: number }>()
 
@@ -192,6 +204,202 @@ export class SwitcherService {
       clearTimeout(this.postRestartTimer)
       this.postRestartTimer = null
     }
+    if (this.initialUpdateTimer) {
+      clearTimeout(this.initialUpdateTimer)
+      this.initialUpdateTimer = null
+    }
+  }
+
+  /** 启动后延迟非阻塞检查一次插件更新，并在后续后台轮询中按 4 小时周期低频检查。 */
+  scheduleInitialUpdateCheck(delayMs = 3000): void {
+    if (this.disposed) return
+    if (this.initialUpdateTimer) clearTimeout(this.initialUpdateTimer)
+    this.initialUpdateTimer = setTimeout(() => {
+      this.initialUpdateTimer = null
+      if (this.disposed) return
+      void this.checkForPluginUpdate({ force: true }).catch(() => {})
+    }, delayMs)
+    unrefTimer(this.initialUpdateTimer)
+  }
+
+  maybeCheckUpdateInBackground(): void {
+    if (this.disposed || this.busy) return
+    if (Date.now() - this.lastUpdateCheckAt < UPDATE_CHECK_INTERVAL_MS) return
+    void this.checkForPluginUpdate({ force: false }).catch(() => {})
+  }
+
+  async checkForPluginUpdate(options?: { force?: boolean }): Promise<void> {
+    if (this.disposed) return
+    if (!this.sys.getSelfPluginMeta || !this.sys.fetchLatestRemoteVersion) return
+    const now = Date.now()
+    if (!options?.force && this.lastUpdateCheckAt > 0) {
+      if (now - this.lastUpdateCheckAt < MANUAL_UPDATE_CHECK_COOLDOWN_MS) return
+    }
+    if (this.inFlightUpdateCheck) {
+      return this.inFlightUpdateCheck
+    }
+
+    const run = async (): Promise<void> => {
+      try {
+        const meta = await this.sys.getSelfPluginMeta!()
+        if (!meta || this.disposed) return
+        this.lastUpdateCheckAt = Date.now()
+
+        const prevVer = this.cachedPluginVersion
+        const prevUpdateJson = JSON.stringify(this.cachedUpdateInfo)
+        this.cachedPluginVersion = meta.version
+
+        let nextUpdate: PluginUpdateInfo | null = null
+        if (meta.sourceKind === 'local-path') {
+          if (
+            meta.localManifestVersion &&
+            compareSemver(meta.localManifestVersion, meta.version) > 0
+          ) {
+            nextUpdate = {
+              currentVersion: meta.version,
+              latestVersion: meta.localManifestVersion,
+              pluginKey: meta.pluginKey,
+              sourceKind: meta.sourceKind,
+              canOneClickUpdate: true
+            }
+          } else {
+            const remoteVer = await this.sys.fetchLatestRemoteVersion!()
+            if (this.disposed) return
+            if (remoteVer && compareSemver(remoteVer, meta.version) > 0) {
+              nextUpdate = {
+                currentVersion: meta.version,
+                latestVersion: remoteVer,
+                pluginKey: meta.pluginKey,
+                sourceKind: meta.sourceKind,
+                canOneClickUpdate: false
+              }
+            }
+          }
+        } else {
+          const remoteVer = await this.sys.fetchLatestRemoteVersion!()
+          if (this.disposed) return
+          if (remoteVer && compareSemver(remoteVer, meta.version) > 0) {
+            nextUpdate = {
+              currentVersion: meta.version,
+              latestVersion: remoteVer,
+              pluginKey: meta.pluginKey,
+              sourceKind: meta.sourceKind,
+              canOneClickUpdate: true
+            }
+          }
+        }
+
+        // 若同一待升版本之前已返回过权限确认命令，保留该命令避免被后台轮询冲掉
+        if (
+          nextUpdate &&
+          this.cachedUpdateInfo?.latestVersion === nextUpdate.latestVersion &&
+          this.cachedUpdateInfo.approvalCommand
+        ) {
+          nextUpdate.approvalCommand = this.cachedUpdateInfo.approvalCommand
+        }
+        this.cachedUpdateInfo = nextUpdate
+
+        if (nextUpdate) {
+          const notifiedVer = await this.orca.storage
+            .get(STORAGE_NOTIFIED_UPDATE_VERSION)
+            .catch(() => null)
+          if (!this.disposed && notifiedVer !== nextUpdate.latestVersion) {
+            await this.orca.storage
+              .set(STORAGE_NOTIFIED_UPDATE_VERSION, nextUpdate.latestVersion)
+              .catch(() => {})
+            void this.orca.host
+              .call('notifications.show', {
+                title: `反重力换号有新版本 v${nextUpdate.latestVersion}`,
+                body: nextUpdate.canOneClickUpdate
+                  ? '打开右侧「反重力换号」面板，点击「立即更新」即可一键升级。'
+                  : `GitHub 已发布 v${nextUpdate.latestVersion}，可在右侧「反重力换号」面板查看。`
+              })
+              .catch(() => {})
+          }
+        }
+
+        const changed =
+          prevVer !== this.cachedPluginVersion ||
+          prevUpdateJson !== JSON.stringify(this.cachedUpdateInfo)
+        if (changed && this.snapshot && !this.snapshot.isPreview && !this.disposed) {
+          const updated: SwitcherSnapshot = {
+            ...this.snapshot,
+            updatedAt: Date.now(),
+            pluginVersion: this.cachedPluginVersion,
+            updateInfo: this.cachedUpdateInfo
+          }
+          this.snapshot = updated
+          this.publish(updated, true)
+        }
+      } catch (err: unknown) {
+        this.orca.log(
+          `checkForPluginUpdate failed: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+    }
+
+    const p = run().finally(() => {
+      if (this.inFlightUpdateCheck === p) {
+        this.inFlightUpdateCheck = null
+      }
+    })
+    this.inFlightUpdateCheck = p
+    return p
+  }
+
+  async applyPluginUpdate(): Promise<ApplyUpdateOutput> {
+    let output: ApplyUpdateOutput = {
+      status: 'failed',
+      message: '当前环境不支持一键更新'
+    }
+    await this.withExclusiveLock('AGY 正在更新插件...', async () => {
+      if (!this.sys.runPluginUpdate) {
+        output = { status: 'failed', message: '当前环境未启用插件自更新接口' }
+        return
+      }
+      const meta = this.sys.getSelfPluginMeta ? await this.sys.getSelfPluginMeta() : null
+      const pluginKey = meta?.pluginKey ?? this.cachedUpdateInfo?.pluginKey ?? null
+      if (!pluginKey) {
+        output = { status: 'failed', message: '未能识别当前安装的插件标识' }
+        return
+      }
+
+      const res = await this.sys.runPluginUpdate(pluginKey)
+      if (res.ok) {
+        const nextVer =
+          res.newVersion ?? this.cachedUpdateInfo?.latestVersion ?? this.cachedPluginVersion
+        this.cachedPluginVersion = nextVer
+        this.cachedUpdateInfo = null
+        output = {
+          status: 'updated',
+          newVersion: nextVer,
+          message: res.message
+        }
+        return
+      }
+
+      if (res.needsApproval) {
+        if (this.cachedUpdateInfo) {
+          this.cachedUpdateInfo = {
+            ...this.cachedUpdateInfo,
+            approvalCommand: res.approvalCommand
+          }
+        }
+        output = {
+          status: 'approval_required',
+          message: res.message,
+          approvalCommand: res.approvalCommand
+        }
+        return
+      }
+
+      output = {
+        status: 'failed',
+        message: res.message
+      }
+    })
+    await this.refreshSnapshot({ refreshAccounts: false })
+    return output
   }
 
   async readSettings(): Promise<SwitcherSettings> {
@@ -338,6 +546,9 @@ export class SwitcherService {
     }
     const force = Boolean(options?.refresh)
     const forceAccounts = Boolean(options?.refreshAccounts ?? options?.refresh)
+    if (force && forceAccounts) {
+      void this.checkForPluginUpdate({ force: false }).catch(() => {})
+    }
     if (!force && this.snapshot && Date.now() - this.snapshot.updatedAt < 3000) {
       return this.snapshot
     }
@@ -595,11 +806,11 @@ export class SwitcherService {
         let restartBlockedReason: string | null = null
         if (isAcp) {
           if (isManagedChat) {
-            restartBlockedReason = 'Orca 托管内置账号（独立于终端池，不受本面板切号影响）'
+            restartBlockedReason = 'Orca 独立账号对话（不受本面板换号影响）'
           } else if (agentState === 'working' || agentState === 'blocked') {
-            restartBlockedReason = '原生 Chat 干活中（共用系统账号），需等其空闲或手动重开'
+            restartBlockedReason = '原生 Chat 正在回复中（共用系统账号），需等其完成或手动重开'
           } else {
-            restartBlockedReason = '原生 Chat 不支持插件原地重启（切号时 Orca 将释放空闲会话）'
+            restartBlockedReason = '原生 Chat 不支持原地重连（切换账号时 Orca 会自动释放空闲对话）'
           }
         } else if (isExternal) {
           restartBlockedReason = '外部非 Orca 终端，不支持原地拉起'
@@ -737,10 +948,10 @@ export class SwitcherService {
           this.lastDriftNotifiedKey = driftKey
           void this.orca.host
             .call('notifications.show', {
-              title: '检测到反重力账号漂移',
-              body: `全局凭证已被旧进程覆盖为 ${shortEmail(drift.actualEmail)}（预期 ${shortEmail(
+              title: '反重力账号被旧终端改回',
+              body: `当前账号被后台旧终端改回 ${shortEmail(drift.actualEmail)}（原为 ${shortEmail(
                 drift.expectedEmail
-              )}），请打开右侧「反重力换号」面板确认后拉齐全部终端。`
+              )}），可在右侧「反重力换号」面板切回。`
             })
             .catch(() => {})
         }
@@ -795,7 +1006,9 @@ export class SwitcherService {
         busyLabel: this.busyLabel,
         scanDegradedReason,
         lastOperation: this.lastOperation,
-        error: errorMessage
+        error: errorMessage,
+        pluginVersion: this.cachedPluginVersion,
+        updateInfo: this.cachedUpdateInfo
       }
 
       this.snapshot = snap
@@ -826,7 +1039,9 @@ export class SwitcherService {
         busyLabel: this.busyLabel,
         scanDegradedReason: this.snapshot?.scanDegradedReason ?? null,
         lastOperation: this.lastOperation,
-        error: message
+        error: message,
+        pluginVersion: this.cachedPluginVersion,
+        updateInfo: this.cachedUpdateInfo
       }
       this.snapshot = fallback
       await this.updateStatusBar(fallback)
@@ -1175,11 +1390,11 @@ export class SwitcherService {
         attempts: 0,
         nextRetryAt: 0
       })
-      const stateHint = qTerm.agentState === 'unknown' ? '状态未知' : '干活中'
-      details.push(`⏳ ${qTerm.workspaceName} · ${qTerm.title}（${stateHint}，已加入空闲自动切队列）`)
+      const stateHint = qTerm.agentState === 'unknown' ? '状态未知' : '运行中'
+      details.push(`⏳ ${qTerm.workspaceName} · ${qTerm.title}（${stateHint}，将在回复完成后自动切换）`)
     }
     for (const sTerm of skippedTargets) {
-      details.push(`↷ ${sTerm.workspaceName} · ${sTerm.title}（按策略跳过）`)
+      details.push(`↷ ${sTerm.workspaceName} · ${sTerm.title}（暂不切换）`)
     }
     await this.writeQueue([...nextQueueMap.values()])
 
@@ -1192,7 +1407,7 @@ export class SwitcherService {
     )
     if (externalOutdated.length > 0) {
       details.push(
-        `⚠️ 另有 ${externalOutdated.length} 个外部非 Orca 的 agy 进程仍用旧号，建议在下方结束以防回跳`
+        `⚠️ 另有 ${externalOutdated.length} 个外部终端仍在使用旧账号，可在「终端」页结束以免把账号改回去`
       )
     }
 
@@ -1205,13 +1420,13 @@ export class SwitcherService {
     )
     if (acpOutdated.length > 0) {
       details.push(
-        `⚠️ 仍有 ${acpOutdated.length} 个宿主原生 Chat 进程挂在旧号（空闲者将由 Orca 释放，干活中需待其完成或重开面板）`
+        `⚠️ 另有 ${acpOutdated.length} 个原生 Chat 对话仍用旧账号（空闲时由 Orca 自动释放，运行中请等回复完成或重开对话）`
       )
     }
 
-    const parts: string[] = [`已切到 ${shortEmail(targetAccount.email)}`]
-    if (restartedCount > 0) parts.push(`原地换号 ${restartedCount} 个`)
-    if (queueTargets.length > 0) parts.push(`排队等空闲 ${queueTargets.length} 个`)
+    const parts: string[] = [`已切换到 ${shortEmail(targetAccount.email)}`]
+    if (restartedCount > 0) parts.push(`已更新 ${restartedCount} 个终端`)
+    if (queueTargets.length > 0) parts.push(`${queueTargets.length} 个等待回复完成后切换`)
     if (skippedTargets.length > 0) parts.push(`跳过 ${skippedTargets.length} 个`)
     if (failedCount > 0) parts.push(`失败 ${failedCount} 个`)
     if (
@@ -1222,8 +1437,8 @@ export class SwitcherService {
     ) {
       parts.push(
         externalOutdated.length + acpOutdated.length > 0
-          ? 'Orca 终端已同步（请留意下方外部/Chat 旧进程）'
-          : '全部终端均已同步'
+          ? 'Orca 终端已更新（请留意下方外部终端/Chat 对话）'
+          : '全部终端已是当前账号'
       )
     }
 
@@ -1272,7 +1487,7 @@ export class SwitcherService {
     preserveOtherQueueTargets?: boolean
   }): Promise<SwitcherSnapshot> {
     let restartedCount = 0
-    await this.withExclusiveLock('AGY 正在准备换号...', async () => {
+    await this.withExclusiveLock('AGY 正在切换账号...', async () => {
       restartedCount = await this.executeSwitchAllLocked(options)
     })
     return this.finalizeAfterSwitch(restartedCount)
@@ -1281,11 +1496,11 @@ export class SwitcherService {
   /** 自动挑选额度最充裕的健康账号并全终端换号（全程单次独占锁，零闪烁零间隙）。 */
   async switchBest(workingPolicy?: WorkingPolicy): Promise<SwitcherSnapshot> {
     let restartedCount = 0
-    await this.withExclusiveLock('AGY 正在检测各账号最新额度...', async () => {
+    await this.withExclusiveLock('AGY 正在检测最佳账号...', async () => {
       const snap = await this.refreshSnapshot({ refreshAccounts: true })
       const best = pickBestAccount(snap.accounts, snap.updatedAt)
       if (!best) {
-        throw new Error('没有状态正常（ok）的可用 Antigravity 账号，已取消切换以保护现有终端')
+        throw new Error('没有可用的正常 Antigravity 账号，已取消切换')
       }
       restartedCount = await this.executeSwitchAllLocked({
         targetAccountId: best.id,
@@ -1297,10 +1512,10 @@ export class SwitcherService {
     return this.finalizeAfterSwitch(restartedCount)
   }
 
-  /** 将所有旧号终端拉齐到预期账号（单次独占锁原子完成）。 */
+  /** 将所有旧账号终端更新到当前账号（单次独占锁原子完成）。 */
   async syncToCurrent(workingPolicy?: WorkingPolicy): Promise<SwitcherSnapshot> {
     let restartedCount = 0
-    await this.withExclusiveLock('AGY 正在准备同步旧号终端...', async () => {
+    await this.withExclusiveLock('AGY 正在更新旧账号终端...', async () => {
       const snap = await this.refreshSnapshot({ refreshAccounts: false })
       const target = this.resolvePreferredTargetAccount(snap)
       if (!target) {
@@ -1331,10 +1546,10 @@ export class SwitcherService {
     return snap.accounts.find((a) => a.isActive) ?? null
   }
 
-  /** 一键强制立即重连当前排队中的所有终端（单次独占锁原子完成）。 */
+  /** 一键立即切换当前等待中的所有终端（单次独占锁原子完成）。 */
   async forceDrainQueue(): Promise<SwitcherSnapshot> {
     let restartedCount = 0
-    await this.withExclusiveLock('AGY 正在强切排队终端...', async () => {
+    await this.withExclusiveLock('AGY 正在立即切换等待终端...', async () => {
       const queue = await this.readQueue()
       if (queue.length === 0) return
       const targetAccountId = queue[0]!.targetAccountId

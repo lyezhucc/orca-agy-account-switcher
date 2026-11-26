@@ -57,9 +57,9 @@ function makeSnapshot(overrides: Partial<SwitcherSnapshot> = {}): SwitcherSnapsh
           {
             group: 'Claude and GPT models',
             sessionUsedPercent: 0,
-            sessionResetsAt: now + 5 * 3600_000,
+            sessionResetsAt: 0,
             weeklyUsedPercent: 0,
-            weeklyResetsAt: now + 6 * 86400_000
+            weeklyResetsAt: 0
           }
         ],
         terminalCount: 1
@@ -160,16 +160,18 @@ test('面板支持底部先选账号再点闪电、所有批量换号先预览�
 
   const view = await mount(panel, { host })
 
-  assert.ok(view.find({ text: '1 旧号' }))
+  assert.ok(view.find({ text: '1 个待切换' }))
   assert.ok(view.find({ text: /周\s+68%/ }))
   assert.ok(view.find({ text: /5天18时14分/ }))
   assert.ok(view.find({ text: 'Claude/GPT' }))
+  // 验证 resetsAt: 0（未开启计时窗口的满血池）正常展示为 0%，绝不误报已重置
   assert.ok(view.find({ text: '5h 0% · 周 0%' }))
+  assert.equal(view.findAll({ text: /已重置/ }).length, 0)
 
-  // 1) 未选下方账号直接点顶部闪电「自动切最空闲号并同步」：绝不立刻切号，必须先弹出确认框
-  await view.press({ text: '自动切最空闲号并同步' })
+  // 1) 未选下方账号直接点顶部闪电「智能切换最佳账号」：绝不立刻切号，必须先弹出确认框
+  await view.press({ text: '智能切换最佳账号' })
   assert.equal(switchAllCalls, 0)
-  assert.ok(view.find({ text: /确认切换到/ }) || view.find({ text: /确认切到最空闲号/ }))
+  assert.ok(view.find({ text: /确认切换到/ }))
   // 点取消后零副作用
   await view.press({ text: '取消' })
   assert.equal(switchAllCalls, 0)
@@ -180,15 +182,15 @@ test('面板支持底部先选账号再点闪电、所有批量换号先预览�
   await view.press(selectButtons[1]!)
   assert.equal(switchAllCalls, 0)
   assert.ok(view.find({ type: 'Button', text: '已选中' }))
-  assert.ok(view.find({ type: 'Button', text: '切到 bob 并同步' }))
+  assert.ok(view.find({ type: 'Button', text: '切换到 bob' }))
 
   // 点击顶部闪电按钮 -> 先展示确认卡（并提醒 5h 已满），点取消后不执行
-  await view.press({ type: 'Button', text: '切到 bob 并同步' })
+  await view.press({ type: 'Button', text: '切换到 bob' })
   assert.equal(switchAllCalls, 0)
   assert.ok(view.find({ text: /5h已满/ }))
   await view.press({ type: 'Button', text: '取消' })
   await view.press({ type: 'Button', text: '已选中' })
-  assert.ok(view.find({ type: 'Button', text: '自动切最空闲号并同步' }))
+  assert.ok(view.find({ type: 'Button', text: '智能切换最佳账号' }))
 
   // 切换到「终端 (1)」Tab 验证终端列表与定位按钮
   await view.select({ label: '视图切换' }, 'terminals')
@@ -197,24 +199,26 @@ test('面板支持底部先选账号再点闪电、所有批量换号先预览�
   await view.press({ text: '定位' })
   assert.equal(focusedId, 'term_geo')
 
-  // 破坏性按钮「强制立切排队 (1)」首次点击进入二次确认，不直接触发
-  await view.press({ text: '强制立切排队 (1)' })
+  // 破坏性按钮「立即切换等待项 (1)」首次点击进入二次确认，不直接触发
+  await view.press({ text: '立即切换等待项 (1)' })
   assert.equal(forceDrainCalls, 0)
-  assert.ok(view.find({ text: '再点确认强切 (1)' }))
+  assert.ok(view.find({ text: '再点确认切换 (1)' }))
 
   // 二次点击才真正触发
-  await view.press({ text: '再点确认强切 (1)' })
+  await view.press({ text: '再点确认切换 (1)' })
   assert.equal(forceDrainCalls, 1)
 
-  // 3) 顶部预警框「一键同步 1 个旧终端到 alice」也必须先预览确认，点「确认同步」才真正执行
-  await view.press({ text: '一键同步 1 个旧终端到 alice' })
+  // 3) 顶部预警框「更新 1 个终端到 alice」也必须先预览确认，点「确认更新」才真正执行
+  await view.press({ text: '更新 1 个终端到 alice' })
   assert.equal(switchAllCalls, 0)
-  assert.ok(view.find({ text: /确认同步旧终端到 alice/ }))
-  await view.press({ text: '确认同步' })
+  assert.ok(view.find({ text: /确认更新旧账号终端到 alice/ }))
+  await view.press({ text: '确认更新' })
 
   assert.equal(switchAllCalls, 1)
   assert.equal(lastSwitchTarget, 'acc-2')
-  assert.ok(view.find({ text: '已对齐' }))
+  // 正常状态下顶栏不堆砌多余「已对齐」或「已全同步」噪音
+  assert.equal(view.findAll({ text: '已对齐' }).length, 0)
+  assert.equal(view.findAll({ text: /已全同步/ }).length, 0)
   assert.ok(view.find({ text: '已切到 alice，原地换号 1 个' }))
   assert.ok(
     view.find({ text: 'stty sane; agy --conversation 8ecc012e-da64-42e5-b8ac-3a0affc1213d' })
@@ -291,10 +295,10 @@ test('面板「终端」Tab 精确展示多工作区原生 Chat（区分宿主�
   })
   const view = await mount(panel, { host })
 
-  // 先验证确认框准确分化「宿主原生 Chat」和「托管 Chat」提示
-  await view.press({ text: '自动切最空闲号并同步' })
-  assert.ok(view.find({ text: /另有 1 个宿主原生 Chat 持旧号/ }))
-  assert.ok(view.find({ text: /1 个托管 Chat 使用独立账号/ }))
+  // 先验证确认框准确分化「原生 Chat 对话」和「独立账号 Chat」提示
+  await view.press({ text: '智能切换最佳账号' })
+  assert.ok(view.find({ text: /另有 1 个原生 Chat 对话仍用旧账号/ }))
+  assert.ok(view.find({ text: /1 个独立账号 Chat 不受本次切换影响/ }))
   await view.press({ text: '取消' })
 
   // 切换到「终端 (2)」Tab
@@ -302,8 +306,7 @@ test('面板「终端」Tab 精确展示多工作区原生 Chat（区分宿主�
   assert.ok(view.find({ text: '原生 Chat 对话 (2)' }))
   assert.ok(view.find({ text: '检查页面“最”字' }))
   assert.ok(view.find({ text: '独立托管对话' }))
-  assert.ok(view.find({ text: '独立凭据' }))
-  assert.ok(view.find({ text: '独立托管' }))
+  assert.ok(view.find({ text: '独立账号' }))
   // 路线 A 严格不展示强杀「结束」按钮
   assert.equal(view.findAll({ type: 'Button', text: '结束' }).length, 0)
 
@@ -413,48 +416,49 @@ test('过期旧快照去红警并标注快照时间、副池识别过期、未�
   })
   const view = await mount(panel, { host })
 
-  // 1) 主池过期窗口：诚实标注已过重置 + 上轮100% + 单卡快照龄，彻底移除「已可重置」歧义
-  assert.ok(view.find({ text: /5h 已过重置/ }))
-  assert.ok(view.find({ text: '上轮 100% · 切入刷新' }))
-  assert.ok(view.find({ text: '快照 · 16小时前' }))
+  // 1) 主池已重置窗口：清晰标注「已重置」+「切换后更新」+ 单卡更新时间，去掉拗口的「已过重置/上轮100%」
+  assert.ok(view.find({ text: /5h 已重置/ }))
+  assert.ok(view.find({ text: '切换后更新' }))
+  assert.ok(view.find({ text: '更新于 16小时前' }))
   assert.equal(view.findAll({ text: /已可重置/ }).length, 0)
+  assert.equal(view.findAll({ text: /已过重置/ }).length, 0)
 
-  // 2) 副池 Claude/GPT 5h 过期同步识别
-  assert.ok(view.find({ text: '5h 已过重置 · 周 50%' }))
+  // 2) 副池 Claude/GPT 5h 已重置同步识别
+  assert.ok(view.find({ text: '5h 已重置 · 周 50%' }))
 
   // 3) 未读取新号与异常号：均不锁死，展示清晰 Badge 并全部提供可点击「选择」
   assert.ok(view.find({ text: '未读取' }))
-  assert.ok(view.find({ text: '尚未读取额度，切入此账号后自动刷新' }))
-  assert.ok(view.find({ text: '额度异常' }))
+  assert.ok(view.find({ text: '尚未读取额度，切换到此账号后自动更新' }))
+  assert.ok(view.find({ text: '读取异常' }))
   assert.equal(view.findAll({ type: 'Button', text: '账号异常' }).length, 0)
 
-  // 3 个非当前账号（过期号、未读取号、异常号）均应提供可点击的「选择」按钮
+  // 3 个非当前账号（已重置号、未读取号、异常号）均应提供可点击的「选择」按钮
   const selectButtons = view.findAll({ type: 'Button', text: '选择' })
   assert.equal(selectButtons.length, 3)
 
-  // 4) 选中过期 100% 账号后展开确认框：不误报「⚠ 5h已满」，带快照时间
+  // 4) 选中已重置 100% 账号后展开确认框：不误报「⚠ 5h已满」，带更新时间
   await view.press(selectButtons[0]!)
-  await view.press({ type: 'Button', text: '切到 bob 并同步' })
+  await view.press({ type: 'Button', text: '切换到 bob' })
   assert.equal(view.findAll({ text: /5h已满/ }).length, 0)
-  assert.ok(view.find({ text: /16小时前快照/ }))
+  assert.ok(view.find({ text: /16小时前更新/ }))
   await view.press({ type: 'Button', text: '取消' })
   await view.press({ type: 'Button', text: '已选中' })
 
-  // 5) 选中未读新号并展开确认框：确认框正常提示未读且允许点击「确认换号」
+  // 5) 选中未读新号并展开确认框：确认框正常提示未读且允许点击「确认切换」
   const refreshedSelectBtns = view.findAll({ type: 'Button', text: '选择' })
   await view.press(refreshedSelectBtns[1]!)
-  await view.press({ type: 'Button', text: '切到 newbie 并同步' })
-  assert.ok(view.find({ text: /尚未读取额度，切入后自动刷新/ }))
-  assert.ok(view.find({ type: 'Button', text: '确认换号' }))
+  await view.press({ type: 'Button', text: '切换到 newbie' })
+  assert.ok(view.find({ text: /尚未读取额度，切换后自动更新/ }))
+  assert.ok(view.find({ type: 'Button', text: '确认切换' }))
   await view.press({ type: 'Button', text: '取消' })
   await view.press({ type: 'Button', text: '已选中' })
 
-  // 6) 选中异常号并展开确认框：给出异常提示但按钮文案变为「仍要切入」且不被禁用
+  // 6) 选中异常号并展开确认框：给出异常提示但按钮文案变为「仍要切换」且不被禁用
   const errSelectBtns = view.findAll({ type: 'Button', text: '选择' })
   await view.press(errSelectBtns[2]!)
-  await view.press({ type: 'Button', text: '切到 broken 并同步' })
+  await view.press({ type: 'Button', text: '切换到 broken' })
   assert.ok(view.find({ text: /上次读取额度异常/ }))
-  assert.ok(view.find({ type: 'Button', text: '仍要切入' }))
+  assert.ok(view.find({ type: 'Button', text: '仍要切换' }))
   await view.press({ type: 'Button', text: '取消' })
 
   assert.deepEqual(view.errors, [])
@@ -564,11 +568,103 @@ test('跨模型池隔离：顶层汇总为 Claude/GPT 93% 时，Gemini 周与确
 
   // 3) 选中 Claude 5h=100% 但 Gemini 5h=18% 的账号展开确认框：不误报 5h已满，且分别展示主池与副池
   await view.press({ type: 'Button', text: '选择' })
-  await view.press({ type: 'Button', text: '切到 dana 并同步' })
+  await view.press({ type: 'Button', text: '切换到 dana' })
   assert.ok(view.find({ text: /Gemini 5h 18% · 周 22%/ }))
   assert.equal(view.findAll({ text: /5h已满/ }).length, 0)
   assert.ok(view.find({ text: /Claude\/GPT 5h 100% · 周 90%/ }))
   await view.press({ type: 'Button', text: '取消' })
+
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.refusals, [])
+  await view.unmount()
+})
+
+test('发现新版本时展示一键更新横幅，支持点击立即升级及新权限命令兜底', async () => {
+  let current = makeSnapshot({
+    outdatedCount: 0,
+    terminals: [],
+    pluginVersion: '0.2.9',
+    updateInfo: {
+      currentVersion: '0.2.9',
+      latestVersion: '0.3.0',
+      pluginKey: 'github.lyezhucc.agy-account-switcher',
+      sourceKind: 'git',
+      canOneClickUpdate: true
+    }
+  })
+  let applyCalls = 0
+  let shouldRequireApproval = true
+
+  const host = mockHost({
+    requests: {
+      'switcher.getState': () => current,
+      'switcher.applyUpdate': () => {
+        applyCalls += 1
+        if (shouldRequireApproval) {
+          const cmd =
+            'orca plugin update github.lyezhucc.agy-account-switcher --approve sha256-xyz='
+          current = {
+            ...current,
+            updatedAt: Date.now() + 10,
+            updateInfo: {
+              ...current.updateInfo!,
+              approvalCommand: cmd
+            }
+          }
+          return {
+            status: 'approval_required' as const,
+            message: '此版本申请了新权限',
+            approvalCommand: cmd
+          }
+        }
+        current = {
+          ...current,
+          updatedAt: Date.now() + 20,
+          pluginVersion: '0.3.0',
+          updateInfo: null
+        }
+        return {
+          status: 'updated' as const,
+          newVersion: '0.3.0',
+          message: '已更新到最新版本 v0.3.0'
+        }
+      }
+    }
+  })
+
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ type: 'Callout', text: /发现新版本 v0\.3\.0/ }))
+  assert.ok(view.find({ text: '当前版本 v0.2.9，点击即可自动升级。' }))
+  assert.ok(view.find({ type: 'Button', text: '立即更新' }))
+
+  // 1) 若遇到需要新权限审批的大版本，自动在横幅内展示完整可复制命令
+  await view.press({ type: 'Button', text: '立即更新' })
+  assert.equal(applyCalls, 1)
+  assert.ok(
+    view.find({
+      text: 'orca plugin update github.lyezhucc.agy-account-switcher --approve sha256-xyz='
+    })
+  )
+
+  // 2) 常规免审版本一键更新完成：清除新版本提示并弹出「更新完成」
+  shouldRequireApproval = false
+  current = {
+    ...current,
+    updatedAt: Date.now() + 15,
+    updateInfo: {
+      currentVersion: '0.2.9',
+      latestVersion: '0.3.0',
+      pluginKey: 'github.lyezhucc.agy-account-switcher',
+      sourceKind: 'git',
+      canOneClickUpdate: true
+    }
+  }
+  await view.press({ label: '刷新账号额度与终端' })
+  await view.press({ type: 'Button', text: '立即更新' })
+  assert.equal(applyCalls, 2)
+  assert.equal(view.findAll({ type: 'Callout', text: /发现新版本 v0\.3\.0/ }).length, 0)
+  assert.ok(view.find({ type: 'Callout', text: /更新完成/ }))
+  assert.ok(view.find({ text: '已更新到最新版本 v0.3.0' }))
 
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.refusals, [])
