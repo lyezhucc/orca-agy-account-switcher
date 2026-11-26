@@ -62,7 +62,7 @@ export function createWorker(
       return service.cancelQueue()
     }),
     orca.panels.handle('switcher.focusTerminal', async (input) => {
-      return service.focusTerminal(input.terminalId)
+      return service.focusTerminal(input)
     }),
     orca.panels.handle('switcher.setPolicy', async (input) => {
       return service.setWorkingPolicy(input.workingPolicy)
@@ -93,6 +93,8 @@ export function createWorker(
     orca.events.on('agent.status.changed', async (event) => {
       await service.handleAgentStatusChanged({
         terminalId: event.terminalId,
+        sessionId: event.sessionId,
+        paneKey: event.paneKey,
         state: event.state
       })
     }),

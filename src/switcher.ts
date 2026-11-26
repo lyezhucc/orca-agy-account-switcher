@@ -10,6 +10,8 @@ import {
   compareSemver,
   computeStatusBar,
   emailsEqual,
+  extractSessionIdFromPaneKey,
+  getSessionQueueKey,
   isManagedChatTerminal,
   isQuotaWindowExpired,
   pickBestAccount,
@@ -22,10 +24,13 @@ import type {
   ApplyUpdateOutput,
   ChatBackendMode,
   ChatEngine,
+  ChatIsolationReason,
   DriftWarning,
+  FocusTerminalInput,
   OperationSummary,
   PluginUpdateInfo,
   RecoveryCommandItem,
+  RestartOneInput,
   SwitcherSnapshot,
   TerminalAgentState,
   WorkingPolicy
@@ -41,6 +46,10 @@ const MAX_QUEUE_AGE_MS = 24 * 60 * 60 * 1000
 const RETRY_BACKOFF_MS = [30_000, 60_000, 120_000]
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000
 const MANUAL_UPDATE_CHECK_COOLDOWN_MS = 5 * 60 * 1000
+const DRIFT_AUTO_HEAL_COOLDOWN_MS = 60 * 1000
+const DRIFT_AUTO_HEAL_NOTIFY_COOLDOWN_MS = 15 * 60 * 1000
+const ACP_NATIVE_RELEASE_POLLS = 24
+const ACP_NATIVE_RELEASE_INTERVAL_MS = 150
 const FALLBACK_PLUGIN_VERSION = '0.2.9'
 
 interface StoredDesiredAccount {
@@ -134,10 +143,19 @@ function resolveChatBackendMode(
   acctState: RawAccountState,
   terminals: readonly AgyTerminalInfo[]
 ): ChatBackendMode {
+  if (acctState.chatKeyOnAgy === true) {
+    return 'orca-managed'
+  }
+  if (acctState.chatAgySignedOut === true) {
+    return 'unknown'
+  }
   if (acctState.chatUsesAgy === true || acctState.chatGoogleSignInInUse === 'agy') {
     return 'host-agy'
   }
-  if (acctState.chatUsesAgy === false || acctState.chatGoogleSignInInUse === 'orca') {
+  if (acctState.chatGoogleSignInInUse === 'orca') {
+    return 'orca-managed'
+  }
+  if (acctState.chatUsesAgy === false) {
     return 'orca-managed'
   }
   let hasManaged = false
@@ -150,6 +168,17 @@ function resolveChatBackendMode(
   if (hasManaged && !hasHost) return 'orca-managed'
   if (hasHost && !hasManaged) return 'host-agy'
   return 'unknown'
+}
+
+function resolveChatIsolationReason(
+  acctState: RawAccountState,
+  chatBackendMode: ChatBackendMode
+): ChatIsolationReason | null {
+  if (acctState.chatKeyOnAgy === true) return 'api-key'
+  if (acctState.chatAgySignedOut === true) return 'agy-signed-out'
+  if (acctState.chatGoogleSignInInUse === 'orca') return 'orca-signin'
+  if (chatBackendMode === 'orca-managed') return 'managed-only'
+  return null
 }
 
 function makeConflictError(message: string): Error & { code: string } {
@@ -178,6 +207,11 @@ export class SwitcherService {
   private drainTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private postRestartTimer: ReturnType<typeof setTimeout> | null = null
   private initialUpdateTimer: ReturnType<typeof setTimeout> | null = null
+  private autoHealTimer: ReturnType<typeof setTimeout> | null = null
+  private lastAutoHealAt = 0
+  private autoHealBackoffStep = 0
+  private lastAutoHealNotifiedKey: string | null = null
+  private lastAutoHealNotifiedAt = 0
   /** 完整命令行与父 PID 仅保留在 Worker 内存，避免超大载荷击穿 panels.post 256 KiB 上限。 */
   private runtimeProcessMeta = new Map<number, { command: string; ppid: number }>()
 
@@ -207,6 +241,10 @@ export class SwitcherService {
     if (this.initialUpdateTimer) {
       clearTimeout(this.initialUpdateTimer)
       this.initialUpdateTimer = null
+    }
+    if (this.autoHealTimer) {
+      clearTimeout(this.autoHealTimer)
+      this.autoHealTimer = null
     }
   }
 
@@ -788,8 +826,17 @@ export class SwitcherService {
           }
         }
 
+        const resolvedSessionId = proc.orcaSessionId ?? orcaAgent?.orcaSessionId ?? null
+        const sessionKey = getSessionQueueKey({
+          processKind: proc.processKind,
+          terminalId: orcaTerm?.handle ?? null,
+          orcaSessionId: resolvedSessionId,
+          pid: proc.pid,
+          chatEngine,
+          isExternal
+        })
         const effectiveAuthEmail = isManagedChat ? null : proc.authEmail
-        const queued = proc.terminalHandle ? queueByTerm.get(proc.terminalHandle) ?? null : null
+        const queued = sessionKey ? queueByTerm.get(sessionKey) ?? null : null
         // H-5: 补齐 desired?.email，避免 selectedAccountId 为空且发生漂移时颠倒黑白
         const expectedForThisTerm =
           queued?.targetEmail ?? selectedAccount?.email ?? desired?.email ?? referenceEmail
@@ -807,23 +854,21 @@ export class SwitcherService {
         if (isAcp) {
           if (isManagedChat) {
             restartBlockedReason = 'Orca 独立账号对话（不受本面板换号影响）'
-          } else if (agentState === 'working' || agentState === 'blocked') {
-            restartBlockedReason = '原生 Chat 正在回复中（共用系统账号），需等其完成或手动重开'
-          } else {
-            restartBlockedReason = '原生 Chat 不支持原地重连（切换账号时 Orca 会自动释放空闲对话）'
+          } else if (!procsRes.ok && !resolvedSessionId) {
+            restartBlockedReason = '进程扫描降级导致会话标识缺失，暂不支持一键同步'
           }
         } else if (isExternal) {
           restartBlockedReason = '外部非 Orca 终端，不支持原地拉起'
         } else if (!orcaTerm) {
-          restartBlockedReason = '终端列表查询降级，暂禁原地重启'
+          restartBlockedReason = '终端列表查询降级，暂不支持原地同步'
         } else if (!orcaTerm.writable) {
           restartBlockedReason = '终端当前不可写'
         } else if (!proc.parentIsShell) {
           restartBlockedReason = '非交互 Shell 启动，退出将关闭终端'
         } else if (duplicateOnSameTerminal) {
-          restartBlockedReason = '同一终端存在多个 agy 进程，暂禁自动原地重启以防串入命令'
+          restartBlockedReason = '同一终端存在多个 agy 进程，暂不支持原地同步以防串入命令'
         } else if (!procsRes.ok && !proc.conversationId) {
-          restartBlockedReason = 'lsof 降级导致缺少会话 ID，暂禁自动重启以免丢失上下文'
+          restartBlockedReason = 'lsof 降级导致缺少会话 ID，暂不支持原地同步以免丢失上下文'
         }
 
         const commandPreview =
@@ -837,7 +882,7 @@ export class SwitcherService {
               false
             )
         const title = isAcp
-          ? orcaAgent?.title || (isManagedChat ? `Orca 托管 Chat (PID ${proc.pid})` : `Orca 原生 Chat (PID ${proc.pid})`)
+          ? orcaAgent?.title || (isManagedChat ? `Orca 独立对话 (PID ${proc.pid})` : `Orca 对话框 (PID ${proc.pid})`)
           : orcaTerm?.title || orcaAgent?.title || `PID ${proc.pid}`
 
         return {
@@ -857,24 +902,27 @@ export class SwitcherService {
           isOutdated,
           queuedTargetEmail: queued?.targetEmail ?? null,
           startedAtText: proc.startedAtText,
-          orcaSessionId: proc.orcaSessionId ?? orcaAgent?.orcaSessionId ?? null,
-          chatEngine
+          orcaSessionId: resolvedSessionId,
+          chatEngine,
+          hasDotGeminiHome: Boolean(proc.hasDotGeminiHome)
         }
       })
 
       // C-5 & M-7: 仅当扫描完整且未处切号窗口时，才清理已消失、已同步、不可重启或超 24h 的僵尸队列项
       let finalQueue = queue
       if (allowStorageWrite && (scanComplete || queueDirty)) {
-        const liveTermById = new Map(
-          terminals.filter((t) => t.terminalId).map((t) => [t.terminalId!, t])
-        )
+        const liveTermByKey = new Map<string, AgyTerminalInfo>()
+        for (const t of terminals) {
+          const k = getSessionQueueKey(t)
+          if (k) liveTermByKey.set(k, t)
+        }
         const accountIdSet = new Set(acctState.accounts.map((a) => a.id))
         const now = Date.now()
         const cleaned = queue.filter((q) => {
           if (!accountIdSet.has(q.targetAccountId)) return false
           if (now - q.enqueuedAt > MAX_QUEUE_AGE_MS) return false
           if (!scanComplete) return true
-          const t = liveTermById.get(q.terminalId)
+          const t = liveTermByKey.get(q.terminalId)
           if (!t) return false
           if (!t.canRestartInPlace) return false
           if (t.authEmail && emailsEqual(t.authEmail, q.targetEmail)) return false
@@ -943,25 +991,55 @@ export class SwitcherService {
       }
 
       if (drift) {
-        const driftKey = `${drift.expectedAccountId ?? drift.expectedEmail}->${drift.actualEmail}`
-        if (settings.autoGuardDrift && this.lastDriftNotifiedKey !== driftKey) {
-          this.lastDriftNotifiedKey = driftKey
-          void this.orca.host
-            .call('notifications.show', {
-              title: '反重力账号被旧终端改回',
-              body: `当前账号被后台旧终端改回 ${shortEmail(drift.actualEmail)}（原为 ${shortEmail(
-                drift.expectedEmail
-              )}），可在右侧「反重力换号」面板切回。`
-            })
-            .catch(() => {})
+        const causedByLiveOldProc = Boolean(
+          acctState.selectedAccountId &&
+            acctState.activeAccountId &&
+            acctState.selectedAccountId !== acctState.activeAccountId &&
+            drift.expectedAccountId &&
+            terminals.some(
+              (t) =>
+                !isManagedChatTerminal(t) &&
+                t.authEmail &&
+                emailsEqual(t.authEmail, drift!.actualEmail)
+            )
+        )
+        const healCooldownMs =
+          DRIFT_AUTO_HEAL_COOLDOWN_MS * Math.pow(2, Math.min(this.autoHealBackoffStep, 3))
+        const canAutoHeal =
+          settings.autoGuardDrift &&
+          causedByLiveOldProc &&
+          !this.busy &&
+          !this.disposed &&
+          Date.now() - this.lastAutoHealAt >= healCooldownMs
+
+        if (canAutoHeal && drift.expectedAccountId) {
+          this.scheduleAutoHealDrift(
+            drift.expectedAccountId,
+            drift.expectedEmail,
+            drift.actualEmail
+          )
+        } else {
+          const driftKey = `${drift.expectedAccountId ?? drift.expectedEmail}->${drift.actualEmail}`
+          if (settings.autoGuardDrift && this.lastDriftNotifiedKey !== driftKey) {
+            this.lastDriftNotifiedKey = driftKey
+            void this.orca.host
+              .call('notifications.show', {
+                title: '反重力账号被旧对话改回',
+                body: `当前账号被后台旧对话改回 ${shortEmail(drift.actualEmail)}（原为 ${shortEmail(
+                  drift.expectedEmail
+                )}），可在右侧「反重力换号」面板切回。`
+              })
+              .catch(() => {})
+          }
         }
       } else {
         this.lastDriftNotifiedKey = null
+        this.autoHealBackoffStep = 0
       }
 
       terminals.sort((a, b) => {
         if (a.isOutdated !== b.isOutdated) return a.isOutdated ? -1 : 1
-        if (a.processKind !== b.processKind) return a.processKind === 'cli' ? -1 : 1
+        if (a.processKind !== b.processKind) return a.processKind === 'acp' ? -1 : 1
         if (a.isExternal !== b.isExternal) return a.isExternal ? 1 : -1
         const wsCmp = a.workspaceName.localeCompare(b.workspaceName)
         if (wsCmp !== 0) return wsCmp
@@ -984,6 +1062,7 @@ export class SwitcherService {
         (t) => !t.authEmail && !isManagedChatTerminal(t)
       ).length
       const chatBackendMode = resolveChatBackendMode(acctState, terminals)
+      const chatIsolationReason = resolveChatIsolationReason(acctState, chatBackendMode)
 
       const snap: SwitcherSnapshot = {
         updatedAt: Date.now(),
@@ -1001,6 +1080,7 @@ export class SwitcherService {
         queuedCount: finalQueue.length,
         workingPolicy: settings.workingPolicy,
         chatBackendMode,
+        chatIsolationReason,
         drift,
         busy: this.busy,
         busyLabel: this.busyLabel,
@@ -1034,6 +1114,7 @@ export class SwitcherService {
         queuedCount: queue.length,
         workingPolicy: settings.workingPolicy,
         chatBackendMode: this.snapshot?.chatBackendMode ?? 'unknown',
+        chatIsolationReason: this.snapshot?.chatIsolationReason ?? null,
         drift: null,
         busy: this.busy,
         busyLabel: this.busyLabel,
@@ -1125,7 +1206,241 @@ export class SwitcherService {
   }
 
   /**
-   * 锁内核心换号执行器（供 switchAll / switchBest / syncToCurrent / forceDrainQueue / restartOne / quickSyncCommand 共享），
+   * 当后台仍存活的旧账号进程自动刷新 OAuth Token 把全局凭证覆写回旧号时，
+   * Orca 的 `selectedAccountId` 与底层凭证失配会导致所有新开/休眠对话框报错
+   * （`The native Antigravity account changed`）。此处自动把全局凭证重新锁回用户选定的账号。
+   */
+  private scheduleAutoHealDrift(
+    expectedAccountId: string,
+    expectedEmail: string,
+    actualEmail: string
+  ): void {
+    if (this.disposed || this.autoHealTimer) return
+    this.lastAutoHealAt = Date.now()
+    this.autoHealTimer = setTimeout(() => {
+      this.autoHealTimer = null
+      if (this.disposed || this.busy) return
+      void this.healAccountDrift(expectedAccountId, expectedEmail, actualEmail).catch((err) =>
+        this.orca.log(`healAccountDrift failed: ${err instanceof Error ? err.message : String(err)}`)
+      )
+    }, 120)
+    unrefTimer(this.autoHealTimer)
+  }
+
+  async healAccountDrift(
+    expectedAccountId: string,
+    expectedEmail: string,
+    actualEmail: string
+  ): Promise<void> {
+    if (this.disposed || this.busy) return
+    let healed = false
+    let stateSyncedWithoutSelect = false
+    await this.withExclusiveLock(`AGY 正在锁定回 ${shortEmail(expectedEmail)}...`, async () => {
+      // P1-4: 锁内强制重拉实时账号状态，严防过期缓存覆盖用户在 Orca 中刚做的新选择！
+      const freshAcct = await this.sys.getAntigravityAccounts()
+      const fetchedNow = Date.now()
+      if (freshAcct.selectedAccountId && freshAcct.selectedAccountId !== expectedAccountId) {
+        this.cachedAccountState = freshAcct
+        this.accountsFetchedAt = fetchedNow
+        const userSelected = freshAcct.accounts.find((a) => a.id === freshAcct.selectedAccountId)
+        if (userSelected) {
+          await this.writeDesiredAccount({
+            id: userSelected.id,
+            email: userSelected.email,
+            observedSelectedId: freshAcct.selectedAccountId
+          }).catch(() => {})
+        }
+        this.autoHealBackoffStep = 0
+        stateSyncedWithoutSelect = true
+        return
+      }
+      if (
+        freshAcct.activeAccountId === expectedAccountId &&
+        (!freshAcct.currentEmail || emailsEqual(freshAcct.currentEmail, expectedEmail))
+      ) {
+        this.cachedAccountState = freshAcct
+        this.accountsFetchedAt = fetchedNow
+        this.autoHealBackoffStep = 0
+        stateSyncedWithoutSelect = true
+        return
+      }
+
+      this.accountMutationEpoch += 1
+      await this.sys.selectAntigravityAccount(expectedAccountId)
+      await this.writeDesiredAccount({
+        id: expectedAccountId,
+        email: expectedEmail,
+        observedSelectedId: expectedAccountId
+      })
+      this.cachedAccountState = {
+        ...freshAcct,
+        activeAccountId: expectedAccountId,
+        selectedAccountId: expectedAccountId,
+        currentEmail: expectedEmail
+      }
+      this.accountsFetchedAt = Date.now()
+      this.lastDriftNotifiedKey = null
+      this.autoHealBackoffStep = Math.min(this.autoHealBackoffStep + 1, 3)
+      healed = true
+
+      // P1-1: 若当前 lastOperation 含有待手动恢复的命令或失败记录，严禁覆盖清空！
+      const hasPendingRecoveryOrFailure = Boolean(
+        this.lastOperation &&
+          (this.lastOperation.recoveryCommands.length > 0 || this.lastOperation.failedCount > 0)
+      )
+      if (!hasPendingRecoveryOrFailure) {
+        this.lastOperation = {
+          at: Date.now(),
+          targetEmail: expectedEmail,
+          restartedCount: 0,
+          queuedCount: this.snapshot?.queuedCount ?? 0,
+          skippedCount: 0,
+          failedCount: 0,
+          rolledBackCount: 0,
+          message: `已拦截旧对话回改，保持在你选定的 ${shortEmail(expectedEmail)}（旧对话曾刷回 ${shortEmail(actualEmail)}）`,
+          details: [
+            `🛡️ 检测到后台旧会话刷新登录态覆写了默认账号，已重新锁定为你选定的 ${shortEmail(expectedEmail)}，确保对话框正常收发`
+          ],
+          recoveryCommands: []
+        }
+      }
+    })
+    if (healed) {
+      const healKey = `${expectedAccountId}->${actualEmail}`
+      const now = Date.now()
+      if (
+        this.lastAutoHealNotifiedKey !== healKey ||
+        now - this.lastAutoHealNotifiedAt >= DRIFT_AUTO_HEAL_NOTIFY_COOLDOWN_MS
+      ) {
+        this.lastAutoHealNotifiedKey = healKey
+        this.lastAutoHealNotifiedAt = now
+        void this.orca.host
+          .call('notifications.show', {
+            title: '已拦截旧对话改回旧号',
+            body: `后台旧会话刷新登录态时改回了 ${shortEmail(actualEmail)}，已为你锁回已选账号 ${shortEmail(
+              expectedEmail
+            )}，对话框可继续正常使用。`
+          })
+          .catch(() => {})
+      }
+      await this.refreshSnapshot({ refreshAccounts: false })
+    } else if (stateSyncedWithoutSelect) {
+      await this.refreshSnapshot({ refreshAccounts: false })
+    }
+  }
+
+  /**
+   * 等待 Orca 原生 `releaseIdleSession` 释放空闲对话框后台 `agy acp` 进程（最长约 3.6s）；
+   * P1-3 加固：宽限期后兜底前实时调用 `listOrcaAgents` 二次复核——
+   * 对批量/自动排队路径（`!allowForceStop`），若复核发现已转忙、状态降级 `unknown` 或显式 `.gemini` 会话受 Orca `owesWork` 保护未释放，
+   * 一律退回 `deferred` 排队，绝不粗暴发 SIGTERM！强停仅留给单点「立即切/重连」或显式 `force`。
+   */
+  private async ensureIdleAcpTargetsReleased(
+    idleAcpTargets: readonly AgyTerminalInfo[],
+    options: {
+      bypassNativeWait: boolean
+      allowForceStop: boolean
+      didCallGlobalSelect: boolean
+    }
+  ): Promise<{
+    released: AgyTerminalInfo[]
+    deferred: AgyTerminalInfo[]
+    failed: AgyTerminalInfo[]
+    usedFallbackStop: boolean
+  }> {
+    if (idleAcpTargets.length === 0) {
+      return { released: [], deferred: [], failed: [], usedFallbackStop: false }
+    }
+
+    if (!options.bypassNativeWait) {
+      for (let i = 0; i < ACP_NATIVE_RELEASE_POLLS; i++) {
+        const anyAlive = idleAcpTargets.some((t) => this.sys.isProcessAlive(t.pid))
+        if (!anyAlive) {
+          return {
+            released: [...idleAcpTargets],
+            deferred: [],
+            failed: [],
+            usedFallbackStop: false
+          }
+        }
+        await this.sys.sleep(ACP_NATIVE_RELEASE_INTERVAL_MS)
+      }
+    }
+
+    const released: AgyTerminalInfo[] = []
+    const deferred: AgyTerminalInfo[] = []
+    const failed: AgyTerminalInfo[] = []
+    const toStop: AgyTerminalInfo[] = []
+    let usedFallbackStop = false
+
+    const stillAlive = idleAcpTargets.filter((t) => {
+      if (!this.sys.isProcessAlive(t.pid)) {
+        released.push(t)
+        return false
+      }
+      return true
+    })
+
+    if (stillAlive.length === 0) {
+      return { released, deferred, failed, usedFallbackStop: false }
+    }
+
+    if (options.allowForceStop) {
+      toStop.push(...stillAlive)
+    } else {
+      const freshAgentsRes = await this.sys.listOrcaAgents()
+      if (!freshAgentsRes.ok) {
+        deferred.push(...stillAlive)
+        return { released, deferred, failed, usedFallbackStop: false }
+      }
+      const freshStateBySid = new Map<string, string>()
+      for (const ag of freshAgentsRes.items) {
+        if (!ag.orcaSessionId) continue
+        const prev = freshStateBySid.get(ag.orcaSessionId)
+        if (
+          prev === undefined ||
+          (AGENT_STATE_PRIORITY[ag.state] ?? 0) > (AGENT_STATE_PRIORITY[prev] ?? 0)
+        ) {
+          freshStateBySid.set(ag.orcaSessionId, ag.state)
+        }
+      }
+
+      for (const term of stillAlive) {
+        const rawState = term.orcaSessionId ? freshStateBySid.get(term.orcaSessionId) : undefined
+        const freshState =
+          rawState !== undefined ? normalizeAgentState(rawState, true) : ('unknown' as const)
+        const protectedByOrcaOwesWork = Boolean(term.hasDotGeminiHome)
+        if (isUnsafeToAutoRestart(freshState) || protectedByOrcaOwesWork) {
+          deferred.push(term)
+        } else {
+          toStop.push(term)
+        }
+      }
+    }
+
+    if (toStop.length > 0) {
+      const results = await Promise.all(
+        toStop.map(async (term) => {
+          if (!this.sys.isProcessAlive(term.pid)) {
+            return { term, stopped: true, usedStop: false }
+          }
+          const stopped = await this.sys.stopProcessGracefully(term.pid, term.startedAtText, 8000)
+          return { term, stopped, usedStop: true }
+        })
+      )
+
+      for (const r of results) {
+        if (r.usedStop) usedFallbackStop = true
+        if (r.stopped) released.push(r.term)
+        else failed.push(r.term)
+      }
+    }
+
+    return { released, deferred, failed, usedFallbackStop }
+  }
+
+  /**
+   * 锁内核心换号执行器（同时覆盖 Orca 原生 Chat 对话框与 CLI 终端），
    * 消除多入口的锁外预处理与双锁释放间隙。
    */
   private async executeSwitchAllLocked(options: {
@@ -1156,29 +1471,41 @@ export class SwitcherService {
 
     const targetIdSet = options.terminalIds ? new Set(options.terminalIds) : null
     const candidates = currentSnap.terminals.filter((t) => {
-      if (t.processKind !== 'cli' || t.isExternal || !t.terminalId || !t.canRestartInPlace) {
+      const key = getSessionQueueKey(t)
+      if (!key || !t.canRestartInPlace) return false
+      if (t.processKind === 'cli' && (t.isExternal || !t.terminalId)) return false
+      if (t.processKind === 'acp' && isManagedChatTerminal(t)) return false
+      if (targetIdSet && !targetIdSet.has(key) && (!t.terminalId || !targetIdSet.has(t.terminalId))) {
         return false
       }
-      if (targetIdSet && !targetIdSet.has(t.terminalId)) return false
       if (onlyOutdated && (!t.authEmail || emailsEqual(t.authEmail, targetAccount.email))) {
         return false
       }
       return true
     })
 
-    const immediateTargets: AgyTerminalInfo[] = []
+    const immediateCliTargets: AgyTerminalInfo[] = []
+    const forceStopAcpTargets: AgyTerminalInfo[] = []
+    const idleAcpTargets: AgyTerminalInfo[] = []
     const queueTargets: AgyTerminalInfo[] = []
     const skippedTargets: AgyTerminalInfo[] = []
 
     for (const t of candidates) {
-      if (isUnsafeToAutoRestart(t.agentState) && policy !== 'force') {
+      const unsafe = isUnsafeToAutoRestart(t.agentState)
+      if (unsafe && policy !== 'force') {
         if (policy === 'queue') {
           queueTargets.push(t)
         } else {
           skippedTargets.push(t)
         }
+      } else if (t.processKind === 'acp') {
+        if (unsafe) {
+          forceStopAcpTargets.push(t)
+        } else {
+          idleAcpTargets.push(t)
+        }
       } else {
-        immediateTargets.push(t)
+        immediateCliTargets.push(t)
       }
     }
 
@@ -1187,133 +1514,243 @@ export class SwitcherService {
     let failedCount = 0
     let rolledBackCount = 0
 
-    // 第 1 步：先停掉所有「立即重启组」旧进程（带 PID 启动时间复核）
-    const stoppedItems: Array<{
+    // 第 1 步：先停掉所有「立即重启 CLI 终端」及「强制中断的运行中对话框」（带 PID 启动时间复核）
+    const stoppedCliItems: Array<{
       term: AgyTerminalInfo
+      key: string
       parentPid: number
       restartCmd: string
     }> = []
-    const stopFailedIds = new Set<string>()
+    const stoppedForcedAcpItems: AgyTerminalInfo[] = []
+    const stopFailedKeys = new Set<string>()
 
-    if (immediateTargets.length > 0) {
-      await this.setBusyLabel(`AGY 正在退出 ${immediateTargets.length} 个旧终端...`)
-      const stopResults = await Promise.all(
-        immediateTargets.map(async (term) => {
-          const meta = this.runtimeProcessMeta.get(term.pid)
-          const fullCmd = meta?.command ?? term.commandPreview
-          const restartCmd = buildRestartCommand(fullCmd, term.conversationId, {
-            pathExists: (p) => this.sys.pathExists(p)
+    if (immediateCliTargets.length > 0 || forceStopAcpTargets.length > 0) {
+      const totalStopping = immediateCliTargets.length + forceStopAcpTargets.length
+      await this.setBusyLabel(`AGY 正在退出 ${totalStopping} 个旧会话...`)
+      const [cliStopResults, acpStopResults] = await Promise.all([
+        Promise.all(
+          immediateCliTargets.map(async (term) => {
+            const meta = this.runtimeProcessMeta.get(term.pid)
+            const fullCmd = meta?.command ?? term.commandPreview
+            const restartCmd = buildRestartCommand(fullCmd, term.conversationId, {
+              pathExists: (p) => this.sys.pathExists(p)
+            })
+            const stopped = await this.sys.stopProcessGracefully(
+              term.pid,
+              term.startedAtText,
+              12000
+            )
+            return {
+              term,
+              key: getSessionQueueKey(term)!,
+              parentPid: meta?.ppid ?? 0,
+              restartCmd,
+              stopped
+            }
           })
-          const stopped = await this.sys.stopProcessGracefully(
-            term.pid,
-            term.startedAtText,
-            12000
-          )
-          return { term, parentPid: meta?.ppid ?? 0, restartCmd, stopped }
-        })
-      )
-      for (const r of stopResults) {
+        ),
+        Promise.all(
+          forceStopAcpTargets.map(async (term) => {
+            const stopped = await this.sys.stopProcessGracefully(
+              term.pid,
+              term.startedAtText,
+              10000
+            )
+            return { term, key: getSessionQueueKey(term)!, stopped }
+          })
+        )
+      ])
+
+      for (const r of cliStopResults) {
         if (r.stopped) {
-          stoppedItems.push({
+          stoppedCliItems.push({
             term: r.term,
+            key: r.key,
             parentPid: r.parentPid,
             restartCmd: r.restartCmd
           })
         } else {
           failedCount += 1
-          stopFailedIds.add(r.term.terminalId!)
+          stopFailedKeys.add(r.key)
           details.push(`✗ ${r.term.workspaceName} · ${r.term.title}：旧进程未在超时内退出或 PID 身份变化`)
         }
       }
-    }
 
-    // 第 2 步：所有待重启旧进程退出后，切换全局 Antigravity 账号；失败则并发回滚原位拉起！
-    await this.setBusyLabel(`AGY 正在切换到 ${shortEmail(targetAccount.email)}...`)
-    try {
-      this.accountMutationEpoch += 1
-      await this.sys.selectAntigravityAccount(targetAccount.id)
-    } catch (selectErr: unknown) {
-      const selectMsg = selectErr instanceof Error ? selectErr.message : String(selectErr)
-      this.orca.log(`selectAntigravityAccount failed: ${selectMsg}`)
-      details.push(`✗ 切换全局账号失败：${selectMsg}`)
-
-      if (stoppedItems.length > 0) {
-        await this.setBusyLabel(`切号失败，正在回滚恢复 ${stoppedItems.length} 个终端...`)
-        const rbResults = await Promise.all(
-          stoppedItems.map(async (item) => {
-            try {
-              await this.relaunchInTerminal(item.term.terminalId!, item.parentPid, item.restartCmd)
-              return { item, ok: true as const, error: '' }
-            } catch (rbErr: unknown) {
-              return {
-                item,
-                ok: false as const,
-                error: rbErr instanceof Error ? rbErr.message : String(rbErr)
-              }
-            }
-          })
-        )
-        for (const r of rbResults) {
-          if (r.ok) {
-            rolledBackCount += 1
-            details.push(`↩ 已自动回滚恢复：${r.item.term.workspaceName} · ${r.item.term.title}`)
-          } else {
-            failedCount += 1
-            recoveryCommands.push({
-              label: `${r.item.term.workspaceName} · ${r.item.term.title}`,
-              command: r.item.restartCmd,
-              reason: `切号失败且自动回滚拉起失败（${r.error}）`
-            })
-            this.orca.log(`RECOVERY_CMD [${r.item.term.workspaceName}]: ${r.item.restartCmd}`)
-          }
+      for (const r of acpStopResults) {
+        if (r.stopped) {
+          stoppedForcedAcpItems.push(r.term)
+        } else {
+          failedCount += 1
+          stopFailedKeys.add(r.key)
+          details.push(`✗ ${r.term.workspaceName} · ${r.term.title}：旧对话框后台进程未在超时内退出`)
         }
       }
-
-      this.lastOperation = {
-        at: Date.now(),
-        targetEmail: targetAccount.email,
-        restartedCount: 0,
-        queuedCount: 0,
-        skippedCount: skippedTargets.length,
-        failedCount: Math.max(1, failedCount),
-        rolledBackCount,
-        message: `切号失败（${selectMsg}）${
-          rolledBackCount > 0 ? `，已自动回滚恢复 ${rolledBackCount} 个终端` : ''
-        }${recoveryCommands.length > 0 ? `，另有 ${recoveryCommands.length} 个需手动恢复` : ''}`,
-        details: details.slice(0, 20),
-        recoveryCommands
-      }
-      return 0
     }
 
-    try {
-      await this.writeDesiredAccount({
-        id: targetAccount.id,
-        email: targetAccount.email,
-        observedSelectedId: targetAccount.id
+    // 第 2 步：切换全局 Antigravity 账号（Orca 会同步触发空闲对话框受控休眠释放）；
+    // 若当前仅针对指定子集（单点切换/重连或队列排空）且全局账号已一致无漂移，跳过重复 select 以免惊动其他空闲对话框！
+    const isSubsetOperation = Boolean(options.terminalIds && options.terminalIds.length > 0)
+    const isGlobalAlreadyOnTarget =
+      currentSnap.activeAccountId === targetAccount.id &&
+      currentSnap.selectedAccountId === targetAccount.id &&
+      !currentSnap.drift
+    const shouldCallGlobalSelect = !(isSubsetOperation && isGlobalAlreadyOnTarget)
+
+    if (shouldCallGlobalSelect) {
+      await this.setBusyLabel(`AGY 正在切换到 ${shortEmail(targetAccount.email)}...`)
+      try {
+        this.accountMutationEpoch += 1
+        await this.sys.selectAntigravityAccount(targetAccount.id)
+      } catch (selectErr: unknown) {
+        const selectMsg = selectErr instanceof Error ? selectErr.message : String(selectErr)
+        this.orca.log(`selectAntigravityAccount failed: ${selectMsg}`)
+        details.push(`✗ 切换全局账号失败：${selectMsg}`)
+
+        if (stoppedCliItems.length > 0) {
+          await this.setBusyLabel(`切号失败，正在回滚恢复 ${stoppedCliItems.length} 个终端...`)
+          const rbResults = await Promise.all(
+            stoppedCliItems.map(async (item) => {
+              try {
+                await this.relaunchInTerminal(item.term.terminalId!, item.parentPid, item.restartCmd)
+                return { item, ok: true as const, error: '' }
+              } catch (rbErr: unknown) {
+                return {
+                  item,
+                  ok: false as const,
+                  error: rbErr instanceof Error ? rbErr.message : String(rbErr)
+                }
+              }
+            })
+          )
+          for (const r of rbResults) {
+            if (r.ok) {
+              rolledBackCount += 1
+              details.push(`↩ 已自动回滚恢复：${r.item.term.workspaceName} · ${r.item.term.title}`)
+            } else {
+              failedCount += 1
+              recoveryCommands.push({
+                label: `${r.item.term.workspaceName} · ${r.item.term.title}`,
+                command: r.item.restartCmd,
+                reason: `切号失败且自动回滚拉起失败（${r.error}）`
+              })
+              this.orca.log(`RECOVERY_CMD [${r.item.term.workspaceName}]: ${r.item.restartCmd}`)
+            }
+          }
+        }
+
+        if (stoppedForcedAcpItems.length > 0) {
+          details.push(
+            `⚠️ 另有 ${stoppedForcedAcpItems.length} 个对话框已中断旧连接，发消息时将自动重连`
+          )
+        }
+
+        this.lastOperation = {
+          at: Date.now(),
+          targetEmail: targetAccount.email,
+          restartedCount: 0,
+          queuedCount: 0,
+          skippedCount: skippedTargets.length,
+          failedCount: Math.max(1, failedCount),
+          rolledBackCount,
+          message: `切号失败（${selectMsg}）${
+            rolledBackCount > 0 ? `，已自动回滚恢复 ${rolledBackCount} 个终端` : ''
+          }${
+            stoppedForcedAcpItems.length > 0
+              ? `，${stoppedForcedAcpItems.length} 个对话框发消息可自动重连`
+              : ''
+          }${recoveryCommands.length > 0 ? `，另有 ${recoveryCommands.length} 个需手动恢复` : ''}`,
+          details: details.slice(0, 20),
+          recoveryCommands
+        }
+        return 0
+      }
+
+      try {
+        await this.writeDesiredAccount({
+          id: targetAccount.id,
+          email: targetAccount.email,
+          observedSelectedId: targetAccount.id
+        })
+      } catch (storageErr: unknown) {
+        this.orca.log(
+          `writeDesiredAccount warning: ${storageErr instanceof Error ? storageErr.message : String(storageErr)}`
+        )
+      }
+
+      if (this.cachedAccountState) {
+        this.cachedAccountState = {
+          ...this.cachedAccountState,
+          activeAccountId: targetAccount.id,
+          selectedAccountId: targetAccount.id,
+          currentEmail: targetAccount.email
+        }
+      }
+    }
+
+    const succeededRestartKeys = new Set<string>()
+    const relaunchFailedKeys = new Set<string>()
+
+    // 记录第 1 步已强制停止的对话框为切换完成（对话框历史完整保留，下次发消息即由已选新账号续接）
+    for (const term of stoppedForcedAcpItems) {
+      restartedCount += 1
+      succeededRestartKeys.add(getSessionQueueKey(term)!)
+      details.push(`✓ ${term.workspaceName} · ${term.title}（对话框已同步到新号，发消息即续接）`)
+    }
+
+    // 第 2.5 步：确认空闲对话框已被 Orca 受控释放；兜底前实时复核 listOrcaAgents 防绕过 owesWork 或转忙误杀（P1-3）
+    const allowForceStopAcp = policy === 'force'
+    let stoppedOutdatedInFallback = false
+    if (idleAcpTargets.length > 0) {
+      await this.setBusyLabel(`AGY 正在同步 ${idleAcpTargets.length} 个未在回复的对话框...`)
+      const bypassNativeWait =
+        !shouldCallGlobalSelect ||
+        (!onlyOutdated && idleAcpTargets.some((t) => emailsEqual(t.authEmail, targetAccount.email)))
+      const acpRelease = await this.ensureIdleAcpTargetsReleased(idleAcpTargets, {
+        bypassNativeWait,
+        allowForceStop: allowForceStopAcp,
+        didCallGlobalSelect: shouldCallGlobalSelect
       })
-    } catch (storageErr: unknown) {
-      this.orca.log(
-        `writeDesiredAccount warning: ${storageErr instanceof Error ? storageErr.message : String(storageErr)}`
-      )
-    }
-
-    if (this.cachedAccountState) {
-      this.cachedAccountState = {
-        ...this.cachedAccountState,
-        activeAccountId: targetAccount.id,
-        selectedAccountId: targetAccount.id,
-        currentEmail: targetAccount.email
+      stoppedOutdatedInFallback =
+        acpRelease.usedFallbackStop &&
+        acpRelease.released.some((t) => t.authEmail && !emailsEqual(t.authEmail, targetAccount.email))
+      for (const term of acpRelease.released) {
+        restartedCount += 1
+        succeededRestartKeys.add(getSessionQueueKey(term)!)
+        details.push(`✓ ${term.workspaceName} · ${term.title}（对话框已同步到新号，发消息即续接）`)
+      }
+      for (const term of acpRelease.deferred) {
+        if (policy === 'queue') {
+          queueTargets.push(term)
+        } else {
+          skippedTargets.push(term)
+        }
+      }
+      for (const term of acpRelease.failed) {
+        failedCount += 1
+        stopFailedKeys.add(getSessionQueueKey(term)!)
+        details.push(`✗ ${term.workspaceName} · ${term.title}：对话框旧连接未能释放`)
       }
     }
 
-    // 第 3 步：并行跨工作区原位拉起所有已停止终端（8 终端耗时从 ~10s 压缩到 ~1s）
-    const succeededRestartIds = new Set<string>()
-    const relaunchFailedIds = new Set<string>()
-    if (stoppedItems.length > 0) {
-      await this.setBusyLabel(`AGY 正在原地恢复 ${stoppedItems.length} 个对话...`)
+    // P2-4: 只要本次兜底或子集路径实际停掉了任何旧账号进程，补调一次幂等 select 确保其退出瞬间未覆盖系统凭证
+    const stoppedOutdatedInStep1 =
+      !shouldCallGlobalSelect &&
+      (stoppedCliItems.some(
+        (it) => it.term.authEmail && !emailsEqual(it.term.authEmail, targetAccount.email)
+      ) ||
+        stoppedForcedAcpItems.some(
+          (t) => t.authEmail && !emailsEqual(t.authEmail, targetAccount.email)
+        ))
+    if (stoppedOutdatedInFallback || stoppedOutdatedInStep1) {
+      this.accountMutationEpoch += 1
+      await this.sys.selectAntigravityAccount(targetAccount.id).catch(() => {})
+    }
+
+    // 第 3 步：并行跨工作区原位拉起所有已停止的 CLI 终端（8 终端耗时从 ~10s 压缩到 ~1s）
+    if (stoppedCliItems.length > 0) {
+      await this.setBusyLabel(`AGY 正在原地恢复 ${stoppedCliItems.length} 个终端对话...`)
       const launchResults = await Promise.all(
-        stoppedItems.map(async (item) => {
+        stoppedCliItems.map(async (item) => {
           try {
             await this.relaunchInTerminal(item.term.terminalId!, item.parentPid, item.restartCmd)
             return { item, ok: true as const, error: '' }
@@ -1329,12 +1766,12 @@ export class SwitcherService {
       for (const r of launchResults) {
         if (r.ok) {
           restartedCount += 1
-          succeededRestartIds.add(r.item.term.terminalId!)
+          succeededRestartKeys.add(r.item.key)
           const convTag = r.item.term.conversationId ? '（已续接原对话）' : '（空白新会话）'
           details.push(`✓ ${r.item.term.workspaceName} · ${r.item.term.title}${convTag}`)
         } else {
           failedCount += 1
-          relaunchFailedIds.add(r.item.term.terminalId!)
+          relaunchFailedKeys.add(r.item.key)
           details.push(`✗ ${r.item.term.workspaceName} · ${r.item.term.title}：拉起失败（${r.error}）`)
           recoveryCommands.push({
             label: `${r.item.term.workspaceName} · ${r.item.term.title}`,
@@ -1346,18 +1783,18 @@ export class SwitcherService {
       }
     }
 
-    // 第 4 步：更新排队队列
+    // 第 4 步：更新排队队列（同时支持对话框 acp:<sessionId> 与终端 term_xxx）
     const existingQueue = await this.readQueue()
     const nextQueueMap = new Map<string, PendingQueueItem>()
     const now = Date.now()
     for (const q of existingQueue) {
-      if (succeededRestartIds.has(q.terminalId) || relaunchFailedIds.has(q.terminalId)) {
+      if (succeededRestartKeys.has(q.terminalId) || relaunchFailedKeys.has(q.terminalId)) {
         continue
       }
-      if (stopFailedIds.has(q.terminalId)) {
+      if (stopFailedKeys.has(q.terminalId)) {
         const nextAttempts = q.attempts + 1
         if (nextAttempts >= MAX_QUEUE_ATTEMPTS) {
-          details.push(`✗ 排队终端 ${q.terminalId} 连续 ${nextAttempts} 次退出超时，已移出队列`)
+          details.push(`✗ 等待项 ${q.terminalId} 连续 ${nextAttempts} 次退出超时，已移出队列`)
           continue
         }
         const backoff = RETRY_BACKOFF_MS[Math.min(nextAttempts - 1, RETRY_BACKOFF_MS.length - 1)]!
@@ -1382,19 +1819,21 @@ export class SwitcherService {
     }
 
     for (const qTerm of queueTargets) {
-      nextQueueMap.set(qTerm.terminalId!, {
-        terminalId: qTerm.terminalId!,
+      const qKey = getSessionQueueKey(qTerm)
+      if (!qKey) continue
+      nextQueueMap.set(qKey, {
+        terminalId: qKey,
         targetAccountId: targetAccount.id,
         targetEmail: targetAccount.email,
         enqueuedAt: now,
         attempts: 0,
         nextRetryAt: 0
       })
-      const stateHint = qTerm.agentState === 'unknown' ? '状态未知' : '运行中'
-      details.push(`⏳ ${qTerm.workspaceName} · ${qTerm.title}（${stateHint}，将在回复完成后自动切换）`)
+      const stateHint = qTerm.agentState === 'unknown' ? '状态未知' : '正在回复'
+      details.push(`⏳ ${qTerm.workspaceName} · ${qTerm.title}（${stateHint}，等当前回复结束后跟进同步到已选新号）`)
     }
     for (const sTerm of skippedTargets) {
-      details.push(`↷ ${sTerm.workspaceName} · ${sTerm.title}（暂不切换）`)
+      details.push(`↷ ${sTerm.workspaceName} · ${sTerm.title}（跳过忙中对话）`)
     }
     await this.writeQueue([...nextQueueMap.values()])
 
@@ -1407,26 +1846,25 @@ export class SwitcherService {
     )
     if (externalOutdated.length > 0) {
       details.push(
-        `⚠️ 另有 ${externalOutdated.length} 个外部终端仍在使用旧账号，可在「终端」页结束以免把账号改回去`
+        `⚠️ 另有 ${externalOutdated.length} 个外部独立终端仍在使用旧账号，可在「对话」页结束以免把账号改回去`
       )
     }
 
-    const acpOutdated = currentSnap.terminals.filter(
+    const blockedAcpOutdated = currentSnap.terminals.filter(
       (t) =>
         t.processKind === 'acp' &&
         !isManagedChatTerminal(t) &&
+        !t.canRestartInPlace &&
         t.authEmail &&
         !emailsEqual(t.authEmail, targetAccount.email)
     )
-    if (acpOutdated.length > 0) {
-      details.push(
-        `⚠️ 另有 ${acpOutdated.length} 个原生 Chat 对话仍用旧账号（空闲时由 Orca 自动释放，运行中请等回复完成或重开对话）`
-      )
+    if (blockedAcpOutdated.length > 0) {
+      details.push(`⚠️ 另有 ${blockedAcpOutdated.length} 个受限对话框仍用旧账号，请重开对应标签页`)
     }
 
     const parts: string[] = [`已切换到 ${shortEmail(targetAccount.email)}`]
-    if (restartedCount > 0) parts.push(`已更新 ${restartedCount} 个终端`)
-    if (queueTargets.length > 0) parts.push(`${queueTargets.length} 个等待回复完成后切换`)
+    if (restartedCount > 0) parts.push(`已同步 ${restartedCount} 个对话`)
+    if (queueTargets.length > 0) parts.push(`${queueTargets.length} 个忙中对话等说完跟进新号`)
     if (skippedTargets.length > 0) parts.push(`跳过 ${skippedTargets.length} 个`)
     if (failedCount > 0) parts.push(`失败 ${failedCount} 个`)
     if (
@@ -1435,11 +1873,15 @@ export class SwitcherService {
       skippedTargets.length === 0 &&
       failedCount === 0
     ) {
-      parts.push(
-        externalOutdated.length + acpOutdated.length > 0
-          ? 'Orca 终端已更新（请留意下方外部终端/Chat 对话）'
-          : '全部终端已是当前账号'
-      )
+      if (externalOutdated.length + blockedAcpOutdated.length > 0) {
+        parts.push('请留意下方外部独立终端提示')
+      } else if (currentSnap.unknownAuthCount > 0) {
+        parts.push(`另有 ${currentSnap.unknownAuthCount} 个对话账号识别中，暂未同步`)
+      } else if (currentSnap.chatBackendMode === 'orca-managed') {
+        parts.push('默认账号已切换（当前对话框为独立单账号模式，详见面板顶部说明）')
+      } else {
+        parts.push('全部对话已是当前账号')
+      }
     }
 
     this.lastOperation = {
@@ -1464,7 +1906,7 @@ export class SwitcherService {
         .catch(() => {})
     }
 
-    if (restartedCount > 0) {
+    if (stoppedCliItems.length > 0) {
       await this.sys.sleep(1000)
     }
     return restartedCount
@@ -1553,12 +1995,15 @@ export class SwitcherService {
       const queue = await this.readQueue()
       if (queue.length === 0) return
       const targetAccountId = queue[0]!.targetAccountId
-      const terminalIds = queue.map((q) => q.terminalId)
+      const terminalIds = queue
+        .filter((q) => q.targetAccountId === targetAccountId)
+        .map((q) => q.terminalId)
       restartedCount = await this.executeSwitchAllLocked({
         targetAccountId,
         workingPolicy: 'force',
         onlyOutdated: true,
-        terminalIds
+        terminalIds,
+        preserveOtherQueueTargets: true
       })
     })
     return this.finalizeAfterSwitch(restartedCount)
@@ -1573,7 +2018,7 @@ export class SwitcherService {
     let restartedCount = 0
     await this.withExclusiveLock('AGY 正在检测账号与终端状态...', async () => {
       const snap = await this.refreshSnapshot({ refreshAccounts: true })
-      if (snap.drift || snap.outdatedCount > 0) {
+      if (snap.drift || snap.outdatedCount + snap.acpOutdatedCount > 0) {
         const target = this.resolvePreferredTargetAccount(snap)
         if (!target) {
           resultMessage = '未能确定目标 Antigravity 账号'
@@ -1585,12 +2030,11 @@ export class SwitcherService {
           onlyOutdated: true,
           preloadedSnapshot: snap
         })
-        resultMessage = this.lastOperation?.message ?? '已同步旧号终端'
+        resultMessage = this.lastOperation?.message ?? '已同步旧账号对话'
         return
       }
-      const externalAndAcp = snap.externalOutdatedCount + snap.acpOutdatedCount
-      if (externalAndAcp > 0) {
-        resultMessage = `Orca CLI 终端已齐，但仍有 ${externalAndAcp} 个外部/原生 Chat 旧号进程，请打开右侧「反重力换号」面板处理`
+      if (snap.externalOutdatedCount > 0) {
+        resultMessage = `Orca 内对话与终端已同步，但仍有 ${snap.externalOutdatedCount} 个外部独立终端使用旧账号，请打开右侧「反重力换号」面板处理`
         return
       }
       const active = snap.accounts.find((a) => a.isActive)
@@ -1620,14 +2064,14 @@ export class SwitcherService {
     return resultMessage
   }
 
-  /** 单独原地重启某一个终端（单次独占锁，不篡改其他排队终端的目标账号）。 */
-  async restartOne(options: {
-    terminalId: string
-    targetAccountId?: string
-    force?: boolean
-  }): Promise<SwitcherSnapshot> {
+  /** 单独切换或重连某一个终端或对话框（单次独占锁，不篡改其他排队项的目标账号）。 */
+  async restartOne(options: RestartOneInput): Promise<SwitcherSnapshot> {
+    const itemKey = options.sessionKey?.trim() || options.terminalId?.trim() || ''
+    if (!itemKey) {
+      throw new Error('缺少目标对话或终端标识')
+    }
     let restartedCount = 0
-    await this.withExclusiveLock('AGY 正在原地重启终端...', async () => {
+    await this.withExclusiveLock('AGY 正在切换对话...', async () => {
       const snap = await this.refreshSnapshot({ refreshAccounts: false })
       const target = options.targetAccountId
         ? snap.accounts.find(
@@ -1644,7 +2088,7 @@ export class SwitcherService {
         targetAccountId: target.id,
         workingPolicy: options.force === false ? undefined : 'force',
         onlyOutdated: false,
-        terminalIds: [options.terminalId],
+        terminalIds: [itemKey],
         preserveOtherQueueTargets: true,
         preloadedSnapshot: snap
       })
@@ -1715,40 +2159,61 @@ export class SwitcherService {
     return this.refreshSnapshot({ refreshAccounts: false })
   }
 
-  async focusTerminal(terminalId: string): Promise<{ focused: boolean }> {
-    return this.orca.host.call('terminal.focus', { terminalId })
+  async focusTerminal(input: string | FocusTerminalInput): Promise<{ focused: boolean }> {
+    const terminalId = typeof input === 'string' ? input : input.terminalId
+    const worktreeId = typeof input === 'string' ? undefined : input.worktreeId
+    if (terminalId) {
+      return this.orca.host.call('terminal.focus', { terminalId })
+    }
+    if (worktreeId) {
+      await this.orca.host.call('workspace.open', { workspaceId: worktreeId })
+      return { focused: true }
+    }
+    return { focused: false }
   }
 
   /**
-   * 监听 `agent.status.changed`：当排队中的终端变为空闲时，防抖 800ms 后自动批量消费。
+   * 监听 `agent.status.changed`：当排队中的对话框或终端回复完成变为空闲时，防抖 800ms 后自动批量消费。
    * H-9 修复：await 后再次核对 `this.disposed`，且所有回调均有 `.catch()` 防 Worker 崩溃。
    */
   async handleAgentStatusChanged(event: {
     terminalId?: string
+    sessionId?: string
+    paneKey?: string
     state: 'working' | 'blocked' | 'waiting' | 'done'
   }): Promise<void> {
     if (this.disposed) return
-    const terminalId = event.terminalId
-    if (!terminalId) return
+    const candidateKeys: string[] = []
+    if (event.terminalId) candidateKeys.push(event.terminalId)
+    if (event.sessionId) candidateKeys.push(`acp:${event.sessionId}`)
+    const paneSid = extractSessionIdFromPaneKey(event.paneKey)
+    if (paneSid) {
+      const pk = `acp:${paneSid}`
+      if (!candidateKeys.includes(pk)) candidateKeys.push(pk)
+    }
+    if (candidateKeys.length === 0) return
 
     if (event.state === 'working' || event.state === 'blocked') {
-      const existingTimer = this.drainTimers.get(terminalId)
-      if (existingTimer) {
-        clearTimeout(existingTimer)
-        this.drainTimers.delete(terminalId)
+      for (const k of candidateKeys) {
+        const existingTimer = this.drainTimers.get(k)
+        if (existingTimer) {
+          clearTimeout(existingTimer)
+          this.drainTimers.delete(k)
+        }
       }
       return
     }
 
     const queue = await this.readQueue()
     if (this.disposed) return
-    if (!queue.some((q) => q.terminalId === terminalId)) return
+    const matchedKey = candidateKeys.find((k) => queue.some((q) => q.terminalId === k))
+    if (!matchedKey) return
 
-    const existingTimer = this.drainTimers.get(terminalId)
+    const existingTimer = this.drainTimers.get(matchedKey)
     if (existingTimer) clearTimeout(existingTimer)
 
     const timer = setTimeout(() => {
-      this.drainTimers.delete(terminalId)
+      this.drainTimers.delete(matchedKey)
       if (this.disposed) return
       void this.drainAnyIdleQueued().catch((err) =>
         this.orca.log(
@@ -1757,10 +2222,10 @@ export class SwitcherService {
       )
     }, 800)
     unrefTimer(timer)
-    this.drainTimers.set(terminalId, timer)
+    this.drainTimers.set(matchedKey, timer)
   }
 
-  /** 批量消费所有已进入空闲且超过退避时间的排队终端（全量异常兜底，绝不打崩 Worker）。 */
+  /** 批量消费所有已进入空闲且超过退避时间的排队对话框与终端（全量异常兜底，绝不打崩 Worker）。 */
   async drainAnyIdleQueued(): Promise<void> {
     if (this.busy || this.disposed) return
     const queue = await this.readQueue()
@@ -1776,7 +2241,10 @@ export class SwitcherService {
 
     for (const q of latestQueue) {
       if (q.nextRetryAt > now) continue
-      const t = snap.terminals.find((item) => item.terminalId === q.terminalId)
+      if (targetAccountId && q.targetAccountId !== targetAccountId) continue
+      const t = snap.terminals.find(
+        (item) => getSessionQueueKey(item) === q.terminalId || item.terminalId === q.terminalId
+      )
       if (
         t &&
         t.canRestartInPlace &&
@@ -1784,19 +2252,21 @@ export class SwitcherService {
         t.authEmail &&
         !emailsEqual(t.authEmail, q.targetEmail)
       ) {
-        readyIds.push(q.terminalId)
         targetAccountId = q.targetAccountId
+        readyIds.push(q.terminalId)
       }
     }
 
     if (readyIds.length === 0 || !targetAccountId) return
-    this.orca.log(`排队终端已空闲（${readyIds.length} 个），自动原地补切至 ${targetAccountId}`)
+    this.orca.log(`排队对话/终端已空闲（${readyIds.length} 个），自动补切至 ${targetAccountId}`)
     try {
+      // P1-2: 使用 'queue' 而非 'force'，防止扫描窗口内刚转忙或短暂降级为 unknown 的对话被误杀中断！
       await this.switchAll({
         targetAccountId,
-        workingPolicy: 'force',
+        workingPolicy: 'queue',
         onlyOutdated: true,
-        terminalIds: readyIds
+        terminalIds: readyIds,
+        preserveOtherQueueTargets: true
       })
     } catch (err: unknown) {
       this.orca.log(

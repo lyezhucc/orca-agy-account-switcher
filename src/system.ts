@@ -17,6 +17,7 @@ import {
   extractApproveCommand,
   extractExplicitLogFile,
   extractLatestTagVersion,
+  hasIsolatedChatGeminiDir,
   isAgyFamilyBinary,
   isManagedAcpBinary,
   isManagedAcpCommand,
@@ -56,6 +57,8 @@ export interface RawAccountState {
   /** `orca account list` 探测到的宿主原生 Chat 是否走本机 `agy` 登录（超时竞速时可能缺省为 null）。 */
   chatUsesAgy?: boolean | null
   chatGoogleSignInInUse?: 'agy' | 'orca' | null
+  chatAgySignedOut?: boolean | null
+  chatKeyOnAgy?: boolean | null
 }
 
 export interface RawOrcaTerminal {
@@ -97,6 +100,7 @@ export interface RawAgyProcess {
   orcaSessionId?: string | null
   isStructuredSession?: boolean
   isManagedAcpServer?: boolean
+  hasDotGeminiHome?: boolean
 }
 
 export interface InstalledPluginMeta {
@@ -574,6 +578,8 @@ export class RealSystemAdapter implements SystemAdapter {
           currentAccount?: { email?: string | null } | null
           chatUsesAgy?: boolean | null
           chatGoogleSignInInUse?: string | null
+          chatAgySignedOut?: boolean | null
+          chatKeyOnAgy?: boolean | null
           accounts?: Array<{
             id: string
             email: string
@@ -651,7 +657,9 @@ export class RealSystemAdapter implements SystemAdapter {
       chatGoogleSignInInUse:
         ag.chatGoogleSignInInUse === 'agy' || ag.chatGoogleSignInInUse === 'orca'
           ? ag.chatGoogleSignInInUse
-          : null
+          : null,
+      chatAgySignedOut: typeof ag.chatAgySignedOut === 'boolean' ? ag.chatAgySignedOut : null,
+      chatKeyOnAgy: typeof ag.chatKeyOnAgy === 'boolean' ? ag.chatKeyOnAgy : null
     }
   }
 
@@ -928,8 +936,15 @@ export class RealSystemAdapter implements SystemAdapter {
       activeRows.map(async (row): Promise<RawAgyProcess> => {
         const fdInfo = lsofMap.get(row.pid)
         const envInfo = envMap.get(row.pid)
-        const isManagedAcpServer =
-          row.isManagedBinary || Boolean(envInfo?.geminiHome?.includes('antigravity-chat'))
+        const geminiHome = envInfo?.geminiHome ?? ''
+        const normalizedGeminiHome = geminiHome.trim().replace(/[\\/]+$/, '')
+        const hasDotGeminiHome =
+          normalizedGeminiHome.length > 0 && basename(normalizedGeminiHome) === '.gemini'
+        const isIsolatedChatHome =
+          geminiHome.includes('antigravity-chat') ||
+          geminiHome.includes('antigravity-agy-chat') ||
+          hasIsolatedChatGeminiDir(row.command)
+        const isManagedAcpServer = row.isManagedBinary || isIsolatedChatHome
         const logPath =
           !isManagedAcpServer ? fdInfo?.logPath ?? explicitLogFiles.get(row.pid) ?? null : null
         const authEmail = logPath ? await this.getCachedLogEmail(logPath) : null
@@ -955,7 +970,8 @@ export class RealSystemAdapter implements SystemAdapter {
           authEmail,
           orcaSessionId: envInfo?.orcaSessionId ?? null,
           isStructuredSession: Boolean(envInfo?.isStructuredSession),
-          isManagedAcpServer
+          isManagedAcpServer,
+          hasDotGeminiHome
         }
       })
     )

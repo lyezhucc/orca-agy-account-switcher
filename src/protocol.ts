@@ -10,6 +10,8 @@ export type ChatEngine = 'host-agy' | 'orca-managed'
 
 export type ChatBackendMode = 'host-agy' | 'orca-managed' | 'unknown'
 
+export type ChatIsolationReason = 'orca-signin' | 'agy-signed-out' | 'api-key' | 'managed-only'
+
 export interface AccountBucketGroup {
   group: string
   sessionUsedPercent: number | null
@@ -57,6 +59,8 @@ export interface AgyTerminalInfo {
   orcaSessionId?: string | null
   /** 原生 Chat 所运行的底层引擎：宿主 `agy`（共享系统号）或 Orca 托管独立账号池。 */
   chatEngine?: ChatEngine | null
+  /** 进程显式携带末段为 `.gemini` 的 `GEMINI_HOME`（受 Orca `releaseIdleSession` / `owesWork` 管辖）。 */
+  hasDotGeminiHome?: boolean
 }
 
 export interface DriftWarning {
@@ -120,6 +124,7 @@ export interface SwitcherSnapshot {
   queuedCount: number
   workingPolicy: WorkingPolicy
   chatBackendMode?: ChatBackendMode
+  chatIsolationReason?: ChatIsolationReason | null
   drift: DriftWarning | null
   busy: boolean
   busyLabel: string | null
@@ -152,7 +157,8 @@ export interface SyncToCurrentInput {
 }
 
 export interface RestartOneInput {
-  terminalId: string
+  terminalId?: string
+  sessionKey?: string
   targetAccountId?: string
   force?: boolean
 }
@@ -163,7 +169,8 @@ export interface KillExternalInput {
 }
 
 export interface FocusTerminalInput {
-  terminalId: string
+  terminalId?: string
+  worktreeId?: string
 }
 
 export interface SetPolicyInput {

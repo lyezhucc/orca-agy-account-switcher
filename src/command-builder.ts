@@ -115,6 +115,17 @@ export function isAgyFamilyBinary(ucommOrToken: string): boolean {
 }
 
 /**
+ * 判定命令行 `--gemini-dir` 是否指向 Orca 隔离 Chat 目录（`antigravity-chat` / `antigravity-agy-chat`）。
+ * 使用 `(.+?)(?=\s+--|$)` 兼容 macOS 默认带空格的 `Application Support` 路径。
+ */
+export function hasIsolatedChatGeminiDir(command: string): boolean {
+  const m = command.match(/--gemini-dir(?:=|\s+)(.+?)(?=\s+--|$)/)
+  if (!m?.[1]) return false
+  const val = m[1].trim()
+  return val.includes('antigravity-chat') || val.includes('antigravity-agy-chat')
+}
+
+/**
  * 过滤 Orca 后台短命探活（约每 5 分钟拉起 4s 做 `listSessions` 检查）与命名助手 `agy acp`：
  * 真正的 Orca 原生 Chat 必注入 `ORCA_STRUCTURED_SESSION=1` 与 `ORCA_AGENT_SESSION_ID`。
  * 仅在已成功采集环境变量（`hasEnvData`）时执行过滤，防止权限/截断降级误隐藏真实对话。
@@ -837,8 +848,8 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
   const managedChatsCount = snapshot.terminals.filter((t) => isManagedChatTerminal(t)).length
   const procSummary =
     managedChatsCount > 0
-      ? `运行中：${snapshot.terminals.length} 个终端（含 ${managedChatsCount} 个独立Chat）`
-      : `运行中：${snapshot.terminals.length} 个终端`
+      ? `运行中：${snapshot.terminals.length} 个对话/终端（含 ${managedChatsCount} 个独立Chat）`
+      : `运行中：${snapshot.terminals.length} 个对话/终端`
 
   const tooltipLines: string[] = [
     `反重力 (AGY) 当前账号：${active?.email ?? snapshot.currentEmail ?? '未知'}`,
@@ -847,13 +858,17 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
     procSummary
   ]
 
+  if (snapshot.chatBackendMode === 'orca-managed') {
+    tooltipLines.push('⚠️ 对话框当前使用独立单账号，未关联多账号池（请打开面板查看）')
+  }
+
   if (snapshot.scanDegradedReason) {
     tooltipLines.push(`⚠️ 降级：${snapshot.scanDegradedReason}`)
   }
 
   if (snapshot.drift) {
     tooltipLines.push(
-      `⚠️ 账号被旧终端改回 ${shortEmail(snapshot.drift.actualEmail)}（原为 ${shortEmail(snapshot.drift.expectedEmail)}）`,
+      `⚠️ 账号被旧会话改回 ${shortEmail(snapshot.drift.actualEmail)}（原为 ${shortEmail(snapshot.drift.expectedEmail)}）`,
       '请打开右侧「反重力换号」面板切回原账号'
     )
     return formatStatusResult(`AGY:${name} ⚠账号被改回`, 'danger', tooltipLines)
@@ -866,16 +881,16 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
       .filter((t) => t.isOutdated)
       .slice(0, 3)
       .map((t) => `• ${t.workspaceName} (${shortEmail(t.authEmail)})`)
-    tooltipLines.push(`⚠️ ${totalOutdated} 个终端仍用旧账号：`, ...outdatedNames)
+    tooltipLines.push(`⚠️ ${totalOutdated} 个对话/终端仍用旧账号：`, ...outdatedNames)
     if (snapshot.queuedCount > 0) {
-      tooltipLines.push(`⏳ ${snapshot.queuedCount} 个运行中，回复完成后自动切换`)
+      tooltipLines.push(`⏳ ${snapshot.queuedCount} 个忙中对话等回复完跟进同步到已选新号`)
     }
     tooltipLines.push('请打开右侧「反重力换号」面板处理')
     return formatStatusResult(`AGY:${name} · ${totalOutdated}待切换`, 'warning', tooltipLines)
   }
 
   if (snapshot.unknownAuthCount > 0) {
-    tooltipLines.push(`ℹ️ ${snapshot.unknownAuthCount} 个终端账号识别中`)
+    tooltipLines.push(`ℹ️ ${snapshot.unknownAuthCount} 个对话/终端账号识别中`)
   }
 
   if (activeSessionExpired) {
@@ -893,13 +908,15 @@ export function computeStatusBar(snapshot: SwitcherSnapshot): StatusBarPresentat
     return formatStatusResult(`AGY:${name} ${usedLabel}`, 'warning', tooltipLines)
   }
 
-  tooltipLines.push('所有终端账号一致 ✓（换号请打开右侧「反重力换号」面板）')
+  tooltipLines.push('所有对话账号一致 ✓（换号请打开右侧「反重力换号」面板）')
   return formatStatusResult(`AGY:${name} ${usedLabel}`, 'neutral', tooltipLines)
 }
 
 export interface SwitchImpactSummary {
   immediateCount: number
+  immediateChatCount: number
   queueCount: number
+  queuedChatCount: number
   skipCount: number
   forcedBusyCount: number
   externalCount: number
@@ -919,8 +936,41 @@ export function isManagedChatTerminal(t: {
 }
 
 /**
+ * 提取终端或宿主共号原生 Chat 的唯一换号队列键：
+ * - CLI 终端保持原 `terminalId`（100% 向后兼容已持久化的 pendingQueue）；
+ * - 宿主共号原生 Chat 返回 `acp:<orcaSessionId>`（缺失 sessionId 时回退 `acp-pid:<pid>`）；
+ * - 托管内置独立账号 Chat 与外部野终端返回 null。
+ */
+export function getSessionQueueKey(t: {
+  processKind: string
+  terminalId?: string | null
+  orcaSessionId?: string | null
+  pid: number
+  chatEngine?: string | null
+  isExternal?: boolean
+}): string | null {
+  if (isManagedChatTerminal(t)) return null
+  if (t.processKind === 'cli') {
+    if (t.isExternal) return null
+    return t.terminalId ?? null
+  }
+  if (t.processKind === 'acp') {
+    const sid = t.orcaSessionId?.trim()
+    return sid ? `acp:${sid}` : `acp-pid:${t.pid}`
+  }
+  return null
+}
+
+/** 从 Orca 原生 Chat 的 paneKey（`structured-agent-session-<uuid>:<leafId>`）提取 orcaSessionId。 */
+export function extractSessionIdFromPaneKey(paneKey?: string | null): string | null {
+  if (!paneKey) return null
+  const m = paneKey.match(/^structured-agent-session-([0-9a-fA-F-]{8,}):/)
+  return m?.[1] ?? null
+}
+
+/**
  * 与 Worker 端 `executeSwitchAllLocked(onlyOutdated=true)` 使用完全一致的筛选规则，
- * 计算若现在切换到 `targetEmail`（配合 `policy`），将会实际影响多少个终端。
+ * 计算若现在切换到 `targetEmail`（配合 `policy`），将会实际影响多少个对话与终端。
  */
 export function computeSwitchImpact(
   snapshot: SwitcherSnapshot,
@@ -928,7 +978,9 @@ export function computeSwitchImpact(
   policy: WorkingPolicy
 ): SwitchImpactSummary {
   let immediateCount = 0
+  let immediateChatCount = 0
   let queueCount = 0
+  let queuedChatCount = 0
   let skipCount = 0
   let forcedBusyCount = 0
   let externalCount = 0
@@ -949,7 +1001,24 @@ export function computeSwitchImpact(
     if (emailsEqual(t.authEmail, targetEmail)) continue
 
     if (t.processKind === 'acp') {
-      acpCount += 1
+      if (!t.canRestartInPlace || !getSessionQueueKey(t)) {
+        acpCount += 1
+        continue
+      }
+      const unsafeChat =
+        t.agentState === 'working' || t.agentState === 'blocked' || t.agentState === 'unknown'
+      if (unsafeChat && policy !== 'force') {
+        if (policy === 'queue') {
+          queueCount += 1
+          queuedChatCount += 1
+        } else {
+          skipCount += 1
+        }
+      } else {
+        immediateCount += 1
+        immediateChatCount += 1
+        if (unsafeChat) forcedBusyCount += 1
+      }
       continue
     }
     if (t.isExternal) {
@@ -974,7 +1043,9 @@ export function computeSwitchImpact(
 
   return {
     immediateCount,
+    immediateChatCount,
     queueCount,
+    queuedChatCount,
     skipCount,
     forcedBusyCount,
     externalCount,

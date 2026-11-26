@@ -190,12 +190,12 @@ const outdatedAlertSnapshot: SwitcherSnapshot = {
       conversationId: null,
       authEmail: 'bob@example.com',
       commandPreview: 'agy acp --dangerously-skip-permissions',
-      canRestartInPlace: false,
-      restartBlockedReason: '原生 Chat 正在回复中（共用系统账号），需等其完成或手动重开',
+      canRestartInPlace: true,
+      restartBlockedReason: null,
       isExternal: false,
       agentState: 'working',
       isOutdated: true,
-      queuedTargetEmail: null,
+      queuedTargetEmail: 'alice@example.com',
       startedAtText: 'Sun Nov 22 18:10:00 2026',
       orcaSessionId: '6e29f04e-5ff0-4b8a-91c5-ed4aadab7a33',
       chatEngine: 'host-agy'
@@ -209,10 +209,10 @@ const outdatedAlertSnapshot: SwitcherSnapshot = {
     skippedCount: 0,
     failedCount: 0,
     rolledBackCount: 0,
-    message: '已切换到 alice，已更新 3 个终端，1 个等待回复完成后切换',
+    message: '已切换到 alice，已同步 3 个对话，1 个忙中对话等说完跟进新号',
     details: [
-      '✓ web-app · 继续吧（已续接原对话）',
-      '⏳ data-tools · 分析接口性能（运行中，将在回复完成后自动切换）'
+      '✓ web-app · 继续吧（对话框已同步到新号，发消息即续接）',
+      '⏳ docs-site · 检查页面文案（正在回复，等当前回复结束后跟进同步到已选新号）'
     ],
     recoveryCommands: []
   }
